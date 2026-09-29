@@ -22,9 +22,11 @@ FONT_DIRS = [
     os.path.expanduser("~/Library/Fonts"),
     "/Library/Fonts",
 ]
+# (label, file, variable-font axis values by axis name)
 CANDIDATES = [
-    ("ABC Areal Mono", "ABCArealMonoVariable.ttf"),
-    ("iA Writer Duo", "iAWriterDuoS-Regular.ttf"),
+    ("iA Writer Duo 400", "iAWriterDuoV.ttf", {"Weight": 400}),
+    ("iA Writer Duo 450", "iAWriterDuoV.ttf", {"Weight": 450}),
+    ("iA Writer Duo 500", "iAWriterDuoV.ttf", {"Weight": 500}),
 ]
 
 SAMPLE = (
@@ -67,10 +69,19 @@ def wrap(text, font, width):
     return lines[:-1]
 
 
-def render(label, path, out_dir):
-    size = size_for_x_height(path, X_HEIGHT)
+def load(path, size, axes):
     font = ImageFont.truetype(path, size)
-    small = ImageFont.truetype(path, round(size * 0.6))
+    if axes:
+        font.set_variation_by_axes(
+            [axes.get(a["name"].decode(), a["default"]) for a in font.get_variation_axes()]
+        )
+    return font
+
+
+def render(label, path, axes, out_dir):
+    size = size_for_x_height(path, X_HEIGHT)
+    font = load(path, size, axes)
+    small = load(path, round(size * 0.6), axes)
     line_h = round(size * LINE_SPACING)
 
     img = Image.new("L", (W, H), 255)
@@ -125,7 +136,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     for f in os.listdir(out_dir):
         os.remove(os.path.join(out_dir, f))
-    pngs = [render(label, find_font(file), out_dir) for label, file in CANDIDATES]
+    pngs = [render(label, find_font(file), axes, out_dir) for label, file, axes in CANDIDATES]
     for png in pngs:
         print(png)
     write_header(pngs, os.path.join(root, "sketches", "step1_font_preview", "previews.h"))
