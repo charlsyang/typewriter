@@ -19,7 +19,7 @@ tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 
 // Refresh policy under test.
 const uint32_t POWER_OFF_AFTER_MS = 1500;  // keep the panel powered between keystrokes
-const uint32_t CLEAN_AFTER_IDLE_MS = 180000; // full refresh once typing pauses this long...
+const uint32_t CLEAN_AFTER_IDLE_MS = 60000; // full refresh once typing pauses this long...
 const uint16_t CLEAN_MIN_PARTIALS = 1;      // ...if anything changed since the last one
 
 std::string text;
@@ -31,8 +31,9 @@ struct Mode {
     const char *name;
     uint32_t passMs; // 0 = library partialUpdate()
 };
-const Mode MODES[] = {{"quick 10 ms", 10}, {"quick 20 ms", 20}, {"quick 30 ms", 30},
-                      {"quick 40 ms", 40}, {"quick 50 ms", 50}, {"library", 0}};
+// Chosen setting first: 20 ms passes (about 150 ms from key to screen).
+const Mode MODES[] = {{"quick 20 ms", 20}, {"quick 30 ms", 30}, {"quick 40 ms", 40},
+                      {"quick 50 ms", 50}, {"library", 0},      {"quick 10 ms", 10}};
 const int MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
 int mode = 0;
 bool inEscape = false;  // skipping a terminal escape sequence (arrow keys etc.)
