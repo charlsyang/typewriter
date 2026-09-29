@@ -31,7 +31,7 @@ grep -rl __unused__ . | grep -E '\.(c|h)$' | xargs sed -i '' 's/__unused__/CTAGS
 Each sketch has a `sketch.yaml` with the board and port.
 
 ```bash
-cd sketches/step0_hello
+cd sketches/step0_hello   # sketches using lib/Typewriter also need: --library ../../lib/Typewriter
 arduino-cli compile --build-path ../../build/step0 .
 arduino-cli upload --build-path ../../build/step0 .
 ../../tools/monitor.py
@@ -40,3 +40,15 @@ arduino-cli upload --build-path ../../build/step0 .
 ## Board facts (measured)
 
 ESP32-D0WD-V3 at 240 MHz, 4 MB flash, 4 MB PSRAM. Rotation 0 is landscape, 1280×720.
+
+## Fonts
+
+Body and status fonts are iA Writer Duo (variable, weight 400), rasterized to 1-bit with a
+black/white cutoff of 64 ("darker edges"):
+
+```bash
+tools/.venv/bin/python tools/make_font.py Duo40 40 --weight 400 --cutoff 64
+tools/.venv/bin/python tools/make_font.py Duo24 24 --weight 400 --cutoff 64 --line-spacing 1.2
+```
+
+`tools/preview_fonts.py` renders the writing screen at 1280×720 for comparing options.

@@ -1,0 +1,2 @@
+default_fqbn: soldered-inkplate-boards:esp32:Inkplate5V2
+default_port: /dev/cu.usbserial-110
