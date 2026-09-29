@@ -13,7 +13,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1280, 720
-MARGIN_X, MARGIN_TOP = 96, 64
+MARGIN_X, MARGIN_TOP = 64, 64
 LINE_SPACING = 1.5
 X_HEIGHT = int(sys.argv[1]) if len(sys.argv) > 1 else 19
 
@@ -23,15 +23,11 @@ FONT_DIRS = [
     "/Library/Fonts",
 ]
 # (label, file, options): options holds variable-font axis values by axis name, plus
-# "cutoff", the ink coverage (0-255) at which a pixel turns black. Default 128;
-# lower thickens stroke edges without changing the design weight.
+# "cutoff", the ink coverage (0-255) at which a pixel turns black (default 128; lower
+# thickens stroke edges without changing the design weight), and "size" in px, which
+# overrides sizing by x-height.
 CANDIDATES = [
-    ("Duo 400", "iAWriterDuoV.ttf", {"Weight": 400}),
-    ("Duo 420", "iAWriterDuoV.ttf", {"Weight": 420}),
-    ("Duo 430", "iAWriterDuoV.ttf", {"Weight": 430}),
-    ("Duo 450", "iAWriterDuoV.ttf", {"Weight": 450}),
-    ("Duo 400 cutoff 64", "iAWriterDuoV.ttf", {"Weight": 400, "cutoff": 64}),
-    ("Duo 420 cutoff 96", "iAWriterDuoV.ttf", {"Weight": 420, "cutoff": 96}),
+    ("Duo 400 cutoff 64", "iAWriterDuoV.ttf", {"Weight": 400, "cutoff": 64, "size": 40}),
 ]
 
 SAMPLE = (
@@ -84,7 +80,7 @@ def load(path, size, axes):
 
 
 def render(label, path, axes, out_dir):
-    size = size_for_x_height(path, X_HEIGHT)
+    size = (axes or {}).get("size") or size_for_x_height(path, X_HEIGHT)
     font = load(path, size, axes)
     small = load(path, round(size * 0.6), axes)
     line_h = round(size * LINE_SPACING)
@@ -92,6 +88,13 @@ def render(label, path, axes, out_dir):
     img = Image.new("L", (W, H), 255)
     draw = ImageDraw.Draw(img)
     lines = wrap(SAMPLE, font, W - 2 * MARGIN_X)
+    # Like the editor, keep the newest lines: drop from the top until the text
+    # clears the status bar.
+    text_bottom = H - 72
+    while MARGIN_TOP + sum(line_h if l else line_h // 2 for l in lines) > text_bottom:
+        lines = lines[1:]
+        while lines and not lines[0]:
+            lines = lines[1:]
     y = MARGIN_TOP
     for line in lines:
         draw.text((MARGIN_X, y), line, font=font, fill=0)
