@@ -1,0 +1,42 @@
+# Typewriter
+
+Firmware that turns a Soldered Inkplate 5 Gen2 into a distraction-free typewriter:
+Bluetooth keyboard in, plain text on e-ink, files synced to Dropbox.
+
+Plan and progress: https://claude.ai/code/artifact/c73d23b6-ee64-4214-970b-06e358a6e9f3
+
+## Setup (macOS, Apple Silicon)
+
+```bash
+brew install arduino-cli
+arduino-cli config init
+arduino-cli config add board_manager.additional_urls https://github.com/SolderedElectronics/Inkplate-Board-Definitions-for-Arduino-IDE/raw/refs/heads/main/package_Inkplate_Boards_index.json
+arduino-cli core update-index
+arduino-cli core install soldered-inkplate-boards:esp32
+arduino-cli lib install InkplateLibrary
+```
+
+The `ctags` that arduino-cli downloads is Intel-only and needs Rosetta. Without Rosetta,
+build Arduino's fork natively and drop it in place of
+`~/Library/Arduino15/packages/builtin/tools/ctags/5.8-arduino11/ctags`:
+
+```bash
+git clone --depth 1 https://github.com/arduino/ctags.git && cd ctags
+grep -rl __unused__ . | grep -E '\.(c|h)$' | xargs sed -i '' 's/__unused__/CTAGS_UNUSED/g'
+./configure && make
+```
+
+## Build, upload, watch serial
+
+Each sketch has a `sketch.yaml` with the board and port.
+
+```bash
+cd sketches/step0_hello
+arduino-cli compile --build-path ../../build/step0 .
+arduino-cli upload --build-path ../../build/step0 .
+../../tools/monitor.py
+```
+
+## Board facts (measured)
+
+ESP32-D0WD-V3 at 240 MHz, 4 MB flash, 4 MB PSRAM. Rotation 0 is landscape, 1280×720.
