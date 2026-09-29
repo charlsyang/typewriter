@@ -23,10 +23,7 @@ FONT_DIRS = [
     "/Library/Fonts",
 ]
 CANDIDATES = [
-    ("Input Mono", "InputMono-Regular.ttf"),
-    ("Suisse Intl Mono", "SuisseIntlMono-Regular.ttf"),
     ("ABC Areal Mono", "ABCArealMonoVariable.ttf"),
-    ("iA Writer Mono", "iAWriterMonoS-Regular.ttf"),
     ("iA Writer Duo", "iAWriterDuoS-Regular.ttf"),
 ]
 
