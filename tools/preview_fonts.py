@@ -22,11 +22,16 @@ FONT_DIRS = [
     os.path.expanduser("~/Library/Fonts"),
     "/Library/Fonts",
 ]
-# (label, file, variable-font axis values by axis name)
+# (label, file, options): options holds variable-font axis values by axis name, plus
+# "cutoff", the ink coverage (0-255) at which a pixel turns black. Default 128;
+# lower thickens stroke edges without changing the design weight.
 CANDIDATES = [
-    ("iA Writer Duo 400", "iAWriterDuoV.ttf", {"Weight": 400}),
-    ("iA Writer Duo 450", "iAWriterDuoV.ttf", {"Weight": 450}),
-    ("iA Writer Duo 500", "iAWriterDuoV.ttf", {"Weight": 500}),
+    ("Duo 400", "iAWriterDuoV.ttf", {"Weight": 400}),
+    ("Duo 420", "iAWriterDuoV.ttf", {"Weight": 420}),
+    ("Duo 430", "iAWriterDuoV.ttf", {"Weight": 430}),
+    ("Duo 450", "iAWriterDuoV.ttf", {"Weight": 450}),
+    ("Duo 400 cutoff 64", "iAWriterDuoV.ttf", {"Weight": 400, "cutoff": 64}),
+    ("Duo 420 cutoff 96", "iAWriterDuoV.ttf", {"Weight": 420, "cutoff": 96}),
 ]
 
 SAMPLE = (
@@ -103,7 +108,8 @@ def render(label, path, axes, out_dir):
     draw.text((MARGIN_X, H - 44), left, font=small, fill=0)
     draw.text((W - MARGIN_X - small.getlength(right), H - 44), right, font=small, fill=0)
 
-    bw = img.point(lambda p: 0 if p < 128 else 255, "1")
+    cutoff = axes.get("cutoff", 128) if axes else 128
+    bw = img.point(lambda p: 0 if 255 - p >= cutoff else 255, "1")
     out = os.path.join(out_dir, label.lower().replace(" ", "-") + ".png")
     bw.save(out)
     return out
