@@ -73,11 +73,57 @@ std::vector<Line> Page::visibleLines(const std::string &text) const {
     }
 }
 
-void Page::render(const std::string &text, const char *statusLeft, const char *statusRight) {
+std::vector<Line> Page::linesFrom(const std::string &text, size_t top) const {
+    std::vector<Line> lines;
+    size_t paraStart = top;
+    while (true) {
+        size_t nl = text.find('\n', paraStart);
+        size_t paraEnd = nl == std::string::npos ? text.size() : nl;
+        wrapParagraph(text, paraStart, paraEnd, lines);
+        if (nl == std::string::npos)
+            return lines;
+        paraStart = nl + 1;
+    }
+}
+
+int32_t Page::height(const std::vector<Line> &lines) const {
+    int32_t h = 0;
+    for (const Line &line : lines)
+        h += lineHeight(line);
+    // The last line holds the cursor, so it always needs full height.
+    if (!lines.empty() && lines.back().start == lines.back().end)
+        h += body_.yAdvance - lineHeight(lines.back());
+    return h;
+}
+
+bool Page::render(const std::string &text, const char *statusLeft, const char *statusRight) {
+    const int32_t room = layout_.textBottom - layout_.marginTop;
+    bool turned = false;
+
+    // Deleted back past the top of the page: show the end of the text instead.
+    if (top_ > text.size()) {
+        std::vector<Line> tail = visibleLines(text);
+        top_ = tail.empty() ? 0 : tail.front().start;
+        turned = true;
+    }
+
+    // Lines stay put until the page is full; then turn to a fresh page that
+    // repeats the last few lines for context.
+    std::vector<Line> lines = linesFrom(text, top_);
+    if (height(lines) > room) {
+        size_t keepFrom = lines.size() > layout_.carryLines + 1 ? lines.size() - 1 - layout_.carryLines : 0;
+        top_ = lines[keepFrom].start;
+        lines.erase(lines.begin(), lines.begin() + keepFrom);
+        if (height(lines) > room) { // a huge paste: fall back to the newest lines
+            lines = visibleLines(text);
+            top_ = lines.empty() ? 0 : lines.front().start;
+        }
+        turned = true;
+    }
+
     display_.clearDisplay();
     const char *s = text.c_str();
 
-    std::vector<Line> lines = visibleLines(text);
     // Skip blank lines at the top of the screen.
     size_t first = 0;
     while (first + 1 < lines.size() && lines[first].start == lines[first].end)
@@ -103,6 +149,7 @@ void Page::render(const std::string &text, const char *statusLeft, const char *s
     size_t rightLen = strlen(statusRight);
     int32_t rightW = measure(small_, statusRight, 0, rightLen);
     drawText(display_, small_, display_.width() - layout_.marginX - rightW, baseline, statusRight, 0, rightLen);
+    return turned;
 }
 
 } // namespace tw

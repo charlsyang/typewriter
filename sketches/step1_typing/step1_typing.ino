@@ -1,8 +1,12 @@
-// Step 1: a scripted typing session to tune how the screen refreshes while writing.
+// Step 1: type from the laptop over USB (tools/type.py) to tune how the screen
+// refreshes while writing, before the Bluetooth keyboard exists.
 //
-// Characters "arrive" on a human-like schedule (with pauses and a few typos fixed by
-// backspace). The loop redraws whenever text changed and the panel is free, so fast
-// typing is batched into one partial update. Timings go to serial (tools/monitor.py).
+// Keys that arrive while the panel is busy are batched into the next partial
+// update. When the page fills it turns with one full refresh, and a pause in
+// typing cleans up ghosting with a full refresh. Timings go to serial.
+//
+// Controls (from tools/type.py): Backspace deletes, Enter starts a new line,
+// Ctrl+L forces a full refresh, Ctrl+N clears the page.
 
 #include <Inkplate.h>
 #include <Page.h>
@@ -13,64 +17,70 @@ Inkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 
 // Refresh policy under test.
-const uint32_t POWER_OFF_AFTER_MS = 1500; // keep the panel powered between keystrokes
-const uint32_t CLEAN_AFTER_IDLE_MS = 4000; // full refresh when typing pauses this long...
-const uint16_t CLEAN_MIN_PARTIALS = 30;    // ...and at least this many partials happened
-
-// '\b' is a backspace; '~' is a 1.5 s thinking pause.
-const char *SCRIPT = "The page moves only one way. There is no going back to fix the sentence above, so the "
-                     "next one has to carry it forward instead.~\n\n"
-                     "“Write first, edit latr\b\b\ber,” she said—and meant it. It’s strange how much quieter "
-                     "the mind gets when the delete key only reaches a few letters…~\n\n"
-                     "Tomorrow the draft will look diffrent\b\b\b\b\berent. Today it only has to exist, one line "
-                     "at a time, until the page is full and the next one begins. Keep going. Don’t look back."
-                     "~ The words that feel wrong now are the ones that get you to the words that feel right.";
+const uint32_t POWER_OFF_AFTER_MS = 1500;  // keep the panel powered between keystrokes
+const uint32_t CLEAN_AFTER_IDLE_MS = 2000; // full refresh once typing pauses this long...
+const uint16_t CLEAN_MIN_PARTIALS = 10;    // ...after at least this many partial updates
 
 std::string text;
-size_t scriptPos = 0;
-uint32_t nextKeyAt = 0;
-bool dirty = true;
+bool dirty = false;
+bool forceFull = true;
 bool panelOn = false;
+bool inEscape = false;  // skipping a terminal escape sequence (arrow keys etc.)
+int utf8Pending = 0;    // continuation bytes still expected for the last character
 uint16_t partialsSinceClean = 0;
-uint32_t lastChangeAt = 0;
+uint32_t lastKeyAt = 0;
 uint32_t lastUpdateAt = 0;
-uint32_t updates = 0;
+uint32_t firstUnshownKeyAt = 0;
 
-// Milliseconds until the next simulated key: ~65 wpm with some jitter.
-uint32_t keyDelay(char c) {
-    if (c == '~')
-        return 1500;
-    uint32_t d = 110 + random(0, 90);
-    if (c == ' ')
-        d += 40;
-    if (c == '.' || c == ',')
-        d += 250;
-    if (c == '\b')
-        d = 140;
-    return d;
+void deleteLastChar() {
+    while (!text.empty()) {
+        uint8_t last = text.back();
+        text.pop_back();
+        if ((last & 0xC0) != 0x80)
+            break;
+    }
 }
 
-// Feeds every key whose time has come; returns how many changed the text.
-int feedKeys(uint32_t now) {
-    int n = 0;
-    while (SCRIPT[scriptPos] && now >= nextKeyAt) {
-        char c = SCRIPT[scriptPos++];
-        if (c == '\b') {
-            // Remove one UTF-8 character.
-            while (!text.empty()) {
-                uint8_t last = text.back();
-                text.pop_back();
-                if ((last & 0xC0) != 0x80)
-                    break;
-            }
-            n++;
-        } else if (c != '~') {
-            text.push_back(c);
-            n++;
-        }
-        nextKeyAt += keyDelay(c);
+void handleByte(uint8_t b, uint32_t now) {
+    if (inEscape) {
+        // CSI sequences end with a letter or '~'; a lone ESC ends at the next byte.
+        if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~')
+            inEscape = false;
+        return;
     }
-    return n;
+    if (utf8Pending > 0) {
+        text.push_back(b);
+        utf8Pending--;
+    } else if (b == 0x1B) {
+        inEscape = true;
+        return;
+    } else if (b == 0x7F || b == 0x08) {
+        deleteLastChar();
+    } else if (b == '\r' || b == '\n') {
+        text.push_back('\n');
+    } else if (b == 0x0C) { // Ctrl+L
+        forceFull = true;
+        return;
+    } else if (b == 0x0E) { // Ctrl+N
+        text.clear();
+        page.reset();
+        forceFull = true;
+        return;
+    } else if (b >= 0x20) {
+        text.push_back(b);
+        if ((b & 0xE0) == 0xC0)
+            utf8Pending = 1;
+        else if ((b & 0xF0) == 0xE0)
+            utf8Pending = 2;
+        else if ((b & 0xF8) == 0xF0)
+            utf8Pending = 3;
+    } else {
+        return; // other control keys do nothing
+    }
+    if (!dirty)
+        firstUnshownKeyAt = now;
+    dirty = true;
+    lastKeyAt = now;
 }
 
 int wordCount() {
@@ -85,46 +95,60 @@ int wordCount() {
     return words;
 }
 
-void draw() {
+// Renders the page; returns true if the page turned.
+bool draw() {
     char left[48], right[48];
-    snprintf(left, sizeof(left), "Typing test · update %lu", (unsigned long)updates);
+    snprintf(left, sizeof(left), "Typing test · %u since clean", partialsSinceClean);
     snprintf(right, sizeof(right), "%d words", wordCount());
-    page.render(text, left, right);
+    return page.render(text, left, right);
+}
+
+void fullRefresh(const char *why) {
+    uint32_t t0 = millis();
+    partialsSinceClean = 0;
+    draw();
+    display.display();
+    panelOn = false;
+    lastUpdateAt = millis();
+    Serial.printf("full refresh (%s): %lu ms\n", why, (unsigned long)(lastUpdateAt - t0));
 }
 
 void setup() {
     Serial.begin(115200);
     display.begin();
     display.setFullUpdateThreshold(0); // we decide when to do full refreshes
-    randomSeed(42);
-    draw();
-    display.display();
-    delay(1000);
-    nextKeyAt = millis();
 }
 
 void loop() {
     uint32_t now = millis();
-    int typed = feedKeys(now);
-    if (typed) {
-        dirty = true;
-        lastChangeAt = now;
+    while (Serial.available())
+        handleByte(Serial.read(), now);
+
+    if (forceFull) {
+        forceFull = false;
+        dirty = false;
+        fullRefresh("requested");
+        return;
     }
 
-    if (dirty) {
-        uint32_t t0 = millis();
-        draw();
-        uint32_t t1 = millis();
-        display.partialUpdate(false, true);
-        uint32_t t2 = millis();
-        panelOn = true;
+    if (dirty && utf8Pending == 0) {
         dirty = false;
-        partialsSinceClean++;
-        updates++;
-        lastUpdateAt = t2;
-        Serial.printf("update %lu: +%d keys, draw %lu ms, panel %lu ms, key-to-screen %lu ms\n",
-                      (unsigned long)updates, typed, (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
-                      (unsigned long)(t2 - lastChangeAt));
+        uint32_t t0 = millis();
+        if (draw()) {
+            display.display();
+            partialsSinceClean = 0;
+            panelOn = false;
+            Serial.printf("page turn: %lu ms\n", (unsigned long)(millis() - t0));
+        } else {
+            uint32_t t1 = millis();
+            display.partialUpdate(false, true);
+            panelOn = true;
+            partialsSinceClean++;
+            Serial.printf("partial: draw %lu ms, panel %lu ms, oldest key waited %lu ms\n",
+                          (unsigned long)(t1 - t0), (unsigned long)(millis() - t1),
+                          (unsigned long)(millis() - firstUnshownKeyAt));
+        }
+        lastUpdateAt = millis();
         return;
     }
 
@@ -133,24 +157,6 @@ void loop() {
         panelOn = false;
     }
 
-    if (partialsSinceClean >= CLEAN_MIN_PARTIALS && now - lastChangeAt > CLEAN_AFTER_IDLE_MS) {
-        uint32_t t0 = millis();
-        draw();
-        display.display();
-        Serial.printf("full refresh after %u partials: %lu ms\n", partialsSinceClean,
-                      (unsigned long)(millis() - t0));
-        partialsSinceClean = 0;
-        panelOn = false;
-    }
-
-    // Script finished: rest, then start over.
-    if (!SCRIPT[scriptPos] && now - lastChangeAt > 15000) {
-        text.clear();
-        scriptPos = 0;
-        updates = 0;
-        draw();
-        display.display();
-        partialsSinceClean = 0;
-        nextKeyAt = millis() + 1000;
-    }
+    if (!dirty && partialsSinceClean >= CLEAN_MIN_PARTIALS && now - lastKeyAt > CLEAN_AFTER_IDLE_MS)
+        fullRefresh("pause");
 }
