@@ -2,29 +2,31 @@
 // refreshes while writing, before the Bluetooth keyboard exists.
 //
 // Keys that arrive while the panel is busy are batched into the next partial
-// update. When the page fills it turns with one full refresh, and a pause in
-// typing cleans up ghosting with a full refresh. Timings go to serial.
+// update. When the page fills it turns with one full refresh, and a long pause
+// cleans up ghosting with a full refresh. Timings go to serial.
 //
 // Controls (from tools/type.py): Backspace deletes, Enter starts a new line,
-// Ctrl+L forces a full refresh, Ctrl+N clears the page.
+// Ctrl+L forces a full refresh, Ctrl+N clears the page, Ctrl+F switches between
+// the quick partial update and the library's own (to compare).
 
-#include <Inkplate.h>
+#include <FastInkplate.h>
 #include <Page.h>
 #include <fonts/Duo24.h>
 #include <fonts/Duo40.h>
 
-Inkplate display(INKPLATE_1BIT);
+tw::FastInkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 
 // Refresh policy under test.
 const uint32_t POWER_OFF_AFTER_MS = 1500;  // keep the panel powered between keystrokes
-const uint32_t CLEAN_AFTER_IDLE_MS = 2000; // full refresh once typing pauses this long...
-const uint16_t CLEAN_MIN_PARTIALS = 10;    // ...after at least this many partial updates
+const uint32_t CLEAN_AFTER_IDLE_MS = 60000; // full refresh once typing pauses this long...
+const uint16_t CLEAN_MIN_PARTIALS = 1;      // ...if anything changed since the last one
 
 std::string text;
 bool dirty = false;
 bool forceFull = true;
 bool panelOn = false;
+bool quick = true;      // quick partial update vs the library's
 bool inEscape = false;  // skipping a terminal escape sequence (arrow keys etc.)
 int utf8Pending = 0;    // continuation bytes still expected for the last character
 uint16_t partialsSinceClean = 0;
@@ -59,6 +61,10 @@ void handleByte(uint8_t b, uint32_t now) {
     } else if (b == '\r' || b == '\n') {
         text.push_back('\n');
     } else if (b == 0x0C) { // Ctrl+L
+        forceFull = true;
+        return;
+    } else if (b == 0x06) { // Ctrl+F
+        quick = !quick;
         forceFull = true;
         return;
     } else if (b == 0x0E) { // Ctrl+N
@@ -98,7 +104,7 @@ int wordCount() {
 // Renders the page; returns true if the page turned.
 bool draw() {
     char left[48], right[48];
-    snprintf(left, sizeof(left), "Typing test · %u since clean", partialsSinceClean);
+    snprintf(left, sizeof(left), "Typing test · %s refresh", quick ? "quick" : "library");
     snprintf(right, sizeof(right), "%d words", wordCount());
     return page.render(text, left, right);
 }
@@ -141,12 +147,12 @@ void loop() {
             Serial.printf("page turn: %lu ms\n", (unsigned long)(millis() - t0));
         } else {
             uint32_t t1 = millis();
-            display.partialUpdate(false, true);
+            uint32_t rows = quick ? display.quickPartialUpdate() : display.partialUpdate(false, true);
             panelOn = true;
             partialsSinceClean++;
-            Serial.printf("partial: draw %lu ms, panel %lu ms, oldest key waited %lu ms\n",
-                          (unsigned long)(t1 - t0), (unsigned long)(millis() - t1),
-                          (unsigned long)(millis() - firstUnshownKeyAt));
+            Serial.printf("%s partial: draw %lu ms, panel %lu ms, oldest key waited %lu ms, rows %lu\n",
+                          quick ? "quick" : "library", (unsigned long)(t1 - t0), (unsigned long)(millis() - t1),
+                          (unsigned long)(millis() - firstUnshownKeyAt), (unsigned long)rows);
         }
         lastUpdateAt = millis();
         return;
