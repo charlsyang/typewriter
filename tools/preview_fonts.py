@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Render the writing screen at the Inkplate's real resolution, one PNG per font.
+
+Text is rasterized the same way the firmware will draw it: anti-aliased by FreeType,
+then thresholded to pure black and white. Fonts are sized to a common x-height so
+they look equally large.
+
+Usage: tools/.venv/bin/python tools/preview_fonts.py [x_height_px]
+"""
+import os
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+W, H = 1280, 720
+MARGIN_X, MARGIN_TOP = 96, 64
+LINE_SPACING = 1.5
+X_HEIGHT = int(sys.argv[1]) if len(sys.argv) > 1 else 19
+
+FONT_DIRS = [os.path.expanduser("~/Library/Fonts"), "/Library/Fonts"]
+CANDIDATES = [
+    ("Input Mono", "InputMono-Regular.ttf"),
+    ("Suisse Intl Mono", "SuisseIntlMono-Regular.ttf"),
+    ("ABC Areal Mono", "ABCArealMonoVariable.ttf"),
+    ("Inter", "InterVariable.ttf"),
+    ("Suisse Works", "SuisseWorks-Book.ttf"),
+    ("SangBleu Republic", "SangBleuRepublic-Book.ttf"),
+]
+
+SAMPLE = (
+    "The page moves only one way. There is no going back to fix the sentence "
+    "above, so the next one has to carry it forward instead.\n"
+    "“Write first, edit later,” she said—and meant it. It’s strange how much "
+    "quieter the mind gets when the delete key only reaches a few letters…\n"
+    "Tomorrow the draft will look different. Today it only has to exist, one "
+    "line at a time, until the"
+)
+
+
+def find_font(name):
+    for d in FONT_DIRS:
+        path = os.path.join(d, name)
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(name)
+
+
+def size_for_x_height(path, target):
+    probe = ImageFont.truetype(path, 100)
+    top, bottom = probe.getbbox("x")[1], probe.getbbox("x")[3]
+    return round(100 * target / (bottom - top))
+
+
+def wrap(text, font, width):
+    lines = []
+    for para in text.split("\n"):
+        line = ""
+        for word in para.split(" "):
+            trial = f"{line} {word}" if line else word
+            if font.getlength(trial) <= width:
+                line = trial
+            else:
+                lines.append(line)
+                line = word
+        lines.append(line)
+        lines.append("")
+    return lines[:-1]
+
+
+def render(label, path, out_dir):
+    size = size_for_x_height(path, X_HEIGHT)
+    font = ImageFont.truetype(path, size)
+    small = ImageFont.truetype(path, round(size * 0.6))
+    line_h = round(size * LINE_SPACING)
+
+    img = Image.new("L", (W, H), 255)
+    draw = ImageDraw.Draw(img)
+    lines = wrap(SAMPLE, font, W - 2 * MARGIN_X)
+    y = MARGIN_TOP
+    for line in lines:
+        draw.text((MARGIN_X, y), line, font=font, fill=0)
+        y += line_h if line else line_h // 2
+    # Cursor block after the last word.
+    y -= line_h
+    x = MARGIN_X + font.getlength(lines[-1]) + 4
+    draw.rectangle([x, y + size * 0.15, x + size * 0.08, y + size * 1.05], fill=0)
+
+    chars = round((W - 2 * MARGIN_X) / font.getlength("n"))
+    left = f"{label} · {size}px · ~{chars} chars/line"
+    right = "2026-09-28.md · 214 words · saved"
+    draw.line([(MARGIN_X, H - 56), (W - MARGIN_X, H - 56)], fill=0, width=1)
+    draw.text((MARGIN_X, H - 44), left, font=small, fill=0)
+    draw.text((W - MARGIN_X - small.getlength(right), H - 44), right, font=small, fill=0)
+
+    bw = img.point(lambda p: 0 if p < 128 else 255, "1")
+    out = os.path.join(out_dir, label.lower().replace(" ", "-") + ".png")
+    bw.save(out)
+    return out
+
+
+def main():
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "build", "font-previews")
+    os.makedirs(out_dir, exist_ok=True)
+    for label, file in CANDIDATES:
+        print(render(label, find_font(file), out_dir))
+
+
+if __name__ == "__main__":
+    main()
