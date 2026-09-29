@@ -5,47 +5,54 @@
 namespace tw {
 
 // Same sequence as EPDDriver::vscan_start(): begin a frame and skip the two
-// rows that are off screen.
+// rows that are off screen. The delayMicroseconds(0) calls are not no-ops: they
+// stretch the CKV pulses enough for the gate driver to register them.
 void FastInkplate::startFrame() {
     CKV_SET;
     delayMicroseconds(7);
     SPV_CLEAR;
     delayMicroseconds(10);
     CKV_CLEAR;
+    delayMicroseconds(0);
     CKV_SET;
     delayMicroseconds(8);
     SPV_SET;
     delayMicroseconds(10);
     CKV_CLEAR;
+    delayMicroseconds(0);
     CKV_SET;
     delayMicroseconds(18);
     CKV_CLEAR;
+    delayMicroseconds(0);
     CKV_SET;
     delayMicroseconds(18);
     CKV_CLEAR;
+    delayMicroseconds(0);
     CKV_SET;
 }
 
 // Shift _dmaLineBuffer into the source drivers (CKV is high while it transfers,
-// driving the previously latched row), then latch it (EPDDriver::vscan_end()).
+// driving the previously latched row), then latch it. Same as sendDataI2S()
+// followed by EPDDriver::vscan_end().
 void FastInkplate::sendRow() {
     sendDataI2S(myI2S, _dmaI2SDesc);
     CKV_CLEAR;
     LE_SET;
     LE_CLEAR;
+    delayMicroseconds(0);
 }
 
 // Advance one row without shifting new data. Only valid while the latched and
-// shifted data are both no-op, so the brief CKV pulse drives nothing.
+// shifted data are both no-op, so the brief CKV pulse drives nothing. The gate
+// driver's CKV limit is 200 kHz (EPDiy's epd_skip()), so one pulse takes 5 us.
 void FastInkplate::skipRow() {
     CKV_SET;
-    delayMicroseconds(1);
+    delayMicroseconds(4);
     CKV_CLEAR;
-    LE_SET;
-    LE_CLEAR;
+    delayMicroseconds(1);
 }
 
-uint32_t FastInkplate::quickPartialUpdate() {
+uint32_t FastInkplate::quickPartialUpdate(bool skipUnchanged, uint32_t passUs) {
     if (getDisplayMode() == INKPLATE_3BIT)
         return 0;
     if (_blockPartial) {
@@ -95,12 +102,13 @@ uint32_t FastInkplate::quickPartialUpdate() {
         return 0;
 
     for (int k = 0; k < 4; k++) {
+        uint32_t passStart = micros();
         uint8_t *dp = _pBuffer;
         startFrame();
         // After startFrame() the latched data is unknown, so the first row is sent.
         bool previousNoop = false;
         for (int i = 0; i < E_INK_HEIGHT; i++) {
-            if (!changed[i] && previousNoop) {
+            if (skipUnchanged && !changed[i] && previousNoop) {
                 skipRow();
             } else {
                 uint8_t *src = dp + rowOut - 1;
@@ -115,6 +123,10 @@ uint32_t FastInkplate::quickPartialUpdate() {
             previousNoop = !changed[i];
             dp += rowOut;
         }
+        // Pixels keep their drive voltage until the next pass addresses them, so
+        // the pass length sets how far the ink moves.
+        while (micros() - passStart < passUs)
+            ;
         delayMicroseconds(230);
     }
 
@@ -125,8 +137,12 @@ uint32_t FastInkplate::quickPartialUpdate() {
     for (int k = 0; k < 2; k++) {
         startFrame();
         sendRow();
-        for (int i = 1; i < E_INK_HEIGHT; i++)
-            skipRow();
+        for (int i = 1; i < E_INK_HEIGHT; i++) {
+            if (skipUnchanged)
+                skipRow();
+            else
+                sendRow();
+        }
         delayMicroseconds(230);
     }
 

@@ -6,8 +6,8 @@
 // cleans up ghosting with a full refresh. Timings go to serial.
 //
 // Controls (from tools/type.py): Backspace deletes, Enter starts a new line,
-// Ctrl+L forces a full refresh, Ctrl+N clears the page, Ctrl+F switches between
-// the quick partial update and the library's own (to compare).
+// Ctrl+L forces a full refresh, Ctrl+N clears the page, Ctrl+F cycles the refresh
+// method: quick (skips unchanged rows) with 10-50 ms drive passes, or the library's.
 
 #include <FastInkplate.h>
 #include <Page.h>
@@ -19,14 +19,22 @@ tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 
 // Refresh policy under test.
 const uint32_t POWER_OFF_AFTER_MS = 1500;  // keep the panel powered between keystrokes
-const uint32_t CLEAN_AFTER_IDLE_MS = 60000; // full refresh once typing pauses this long...
+const uint32_t CLEAN_AFTER_IDLE_MS = 180000; // full refresh once typing pauses this long...
 const uint16_t CLEAN_MIN_PARTIALS = 1;      // ...if anything changed since the last one
 
 std::string text;
 bool dirty = false;
 bool forceFull = true;
 bool panelOn = false;
-bool quick = true;      // quick partial update vs the library's
+// Refresh methods to compare: quick with each pass padded to passMs, or the library's.
+struct Mode {
+    const char *name;
+    uint32_t passMs; // 0 = library partialUpdate()
+};
+const Mode MODES[] = {{"quick 10 ms", 10}, {"quick 20 ms", 20}, {"quick 30 ms", 30},
+                      {"quick 40 ms", 40}, {"quick 50 ms", 50}, {"library", 0}};
+const int MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
+int mode = 0;
 bool inEscape = false;  // skipping a terminal escape sequence (arrow keys etc.)
 int utf8Pending = 0;    // continuation bytes still expected for the last character
 uint16_t partialsSinceClean = 0;
@@ -64,9 +72,8 @@ void handleByte(uint8_t b, uint32_t now) {
         forceFull = true;
         return;
     } else if (b == 0x06) { // Ctrl+F
-        quick = !quick;
-        forceFull = true;
-        return;
+        // No full refresh, so lines typed with each method stay side by side.
+        mode = (mode + 1) % MODE_COUNT;
     } else if (b == 0x0E) { // Ctrl+N
         text.clear();
         page.reset();
@@ -104,7 +111,7 @@ int wordCount() {
 // Renders the page; returns true if the page turned.
 bool draw() {
     char left[48], right[48];
-    snprintf(left, sizeof(left), "Typing test · %s refresh", quick ? "quick" : "library");
+    snprintf(left, sizeof(left), "Typing test · %s refresh", MODES[mode].name);
     snprintf(right, sizeof(right), "%d words", wordCount());
     return page.render(text, left, right);
 }
@@ -147,11 +154,12 @@ void loop() {
             Serial.printf("page turn: %lu ms\n", (unsigned long)(millis() - t0));
         } else {
             uint32_t t1 = millis();
-            uint32_t rows = quick ? display.quickPartialUpdate() : display.partialUpdate(false, true);
+            uint32_t rows = MODES[mode].passMs == 0 ? display.partialUpdate(false, true)
+                                                    : display.quickPartialUpdate(true, MODES[mode].passMs * 1000);
             panelOn = true;
             partialsSinceClean++;
-            Serial.printf("%s partial: draw %lu ms, panel %lu ms, oldest key waited %lu ms, rows %lu\n",
-                          quick ? "quick" : "library", (unsigned long)(t1 - t0), (unsigned long)(millis() - t1),
+            Serial.printf("%s: draw %lu ms, panel %lu ms, oldest key waited %lu ms, rows %lu\n",
+                          MODES[mode].name, (unsigned long)(t1 - t0), (unsigned long)(millis() - t1),
                           (unsigned long)(millis() - firstUnshownKeyAt), (unsigned long)rows);
         }
         lastUpdateAt = millis();
