@@ -114,7 +114,9 @@ bool draw() {
     char left[48], right[48];
     snprintf(left, sizeof(left), "Typing test · %s refresh", MODES[mode].name);
     snprintf(right, sizeof(right), "%d words", wordCount());
-    return page.render(text, left, right);
+    char footer[96];
+    snprintf(footer, sizeof(footer), "%s · %s", left, right);
+    return page.render(text, footer);
 }
 
 void fullRefresh(const char *why) {

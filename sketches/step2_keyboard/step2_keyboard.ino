@@ -122,7 +122,9 @@ bool drawPage() {
     char left[48], right[32];
     keyboardStatus(left, sizeof(left));
     snprintf(right, sizeof(right), "%d words", wordCount());
-    return page.render(text, left, right);
+    char footer[96];
+    snprintf(footer, sizeof(footer), "%s · %s", left, right);
+    return page.render(text, footer);
 }
 
 void drawCentered(const GFXfont &font, int16_t ascent, int32_t y, const char *s) {

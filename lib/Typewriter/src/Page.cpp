@@ -96,7 +96,12 @@ int32_t Page::height(const std::vector<Line> &lines) const {
     return h;
 }
 
-bool Page::render(const std::string &text, const char *statusLeft, const char *statusRight) {
+void Page::showEnd(const std::string &text) {
+    std::vector<Line> tail = visibleLines(text);
+    top_ = tail.empty() ? 0 : tail.front().start;
+}
+
+bool Page::render(const std::string &text, const char *footer) {
     const int32_t room = layout_.textBottom - layout_.marginTop;
     bool turned = false;
 
@@ -142,13 +147,8 @@ bool Page::render(const std::string &text, const char *statusLeft, const char *s
     const int16_t size = body_.yAdvance * 2 / 3; // font size in px (line spacing is 1.5)
     display_.fillRect(cursorX + 4, cursorY + size * 15 / 100, 3, size * 90 / 100, BLACK);
 
-    // Status bar.
-    display_.drawFastHLine(layout_.marginX, layout_.statusRuleY, display_.width() - 2 * layout_.marginX, BLACK);
-    int32_t baseline = layout_.statusTop + smallAscent_;
-    drawText(display_, small_, layout_.marginX, baseline, statusLeft, 0, strlen(statusLeft));
-    size_t rightLen = strlen(statusRight);
-    int32_t rightW = measure(small_, statusRight, 0, rightLen);
-    drawText(display_, small_, display_.width() - layout_.marginX - rightW, baseline, statusRight, 0, rightLen);
+    if (footer && *footer)
+        drawText(display_, small_, layout_.marginX, layout_.footerTop + smallAscent_, footer, 0, strlen(footer));
     return turned;
 }
 

@@ -1,4 +1,5 @@
-// The writing screen: the newest lines of the document, a cursor, and a status bar.
+// The writing screen: the newest lines of the document, a cursor, and an optional
+// one-line footer for notices.
 #pragma once
 
 #include <Inkplate.h>
@@ -10,9 +11,8 @@ namespace tw {
 struct Layout {
     int16_t marginX = 64;
     int16_t marginTop = 64;
-    int16_t textBottom = 720 - 72; // text stops above the status bar
-    int16_t statusRuleY = 720 - 56;
-    int16_t statusTop = 720 - 44;
+    int16_t textBottom = 720 - 72; // text stops above the footer line
+    int16_t footerTop = 720 - 44;  // notices and the Cmd+I status, when shown
     size_t carryLines = 2; // lines repeated at the top after a page turn
 };
 
@@ -28,11 +28,16 @@ class Page {
          Layout layout = Layout());
 
     // Draws the whole screen into the frame buffer; the caller refreshes the panel.
-    // Returns true when the page turned, so the caller should do a full refresh.
-    bool render(const std::string &text, const char *statusLeft, const char *statusRight);
+    // footer may be null. Returns true when the page turned, so the caller should
+    // do a full refresh.
+    bool render(const std::string &text, const char *footer);
 
     // Starts the next render at the top of the text (for a new document).
     void reset() { top_ = 0; }
+
+    // Starts the next render on a page that ends with the end of the text (for
+    // opening an existing document).
+    void showEnd(const std::string &text);
 
     // The lines that fit on screen, ending with the line that holds the end of the text.
     std::vector<Line> visibleLines(const std::string &text) const;

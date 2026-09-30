@@ -180,14 +180,18 @@ void onKeyboardReport(const uint8_t *r) {
 }
 
 void onReport(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
-    if (len == 8) {
-        onKeyboardReport(data);
-    } else {
+    // Log reports that aren't plain key presses (or any report with an unusual key).
+    bool plain = len == 8;
+    for (size_t i = 2; plain && i < 8; i++)
+        plain = data[i] == 0 || (data[i] >= KEY_A && data[i] <= 0x52);
+    if (!plain) {
         Serial.printf("kbd: %u-byte report on handle %u:", (unsigned)len, chr->getHandle());
         for (size_t i = 0; i < len; i++)
             Serial.printf(" %02x", data[i]);
         Serial.println();
     }
+    if (len == 8)
+        onKeyboardReport(data);
 }
 
 class ScanCallbacks : public NimBLEScanCallbacks {
