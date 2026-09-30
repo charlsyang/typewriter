@@ -28,9 +28,9 @@ class Page {
          Layout layout = Layout());
 
     // Draws the whole screen into the frame buffer; the caller refreshes the panel.
-    // footer may be null. Returns true when the page turned, so the caller should
-    // do a full refresh.
-    bool render(const std::string &text, const char *footer);
+    // The footer has a left and a right-aligned part; either may be null. Returns
+    // true when the page turned, so the caller should do a full refresh.
+    bool render(const std::string &text, const char *footerLeft, const char *footerRight = nullptr);
 
     // Starts the next render at the top of the text (for a new document).
     void reset() { top_ = 0; }

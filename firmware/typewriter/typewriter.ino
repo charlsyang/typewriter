@@ -5,7 +5,7 @@
 // your text; a footer line appears when something needs attention, or on Cmd+I.
 //
 // Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save now,
-// Cmd+I show status, Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
+// Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
@@ -116,18 +116,6 @@ void deleteLastWord() {
         t.pop_back();
     while (!t.empty() && t.back() != ' ' && t.back() != '\n')
         deleteLastChar();
-}
-
-int wordCount() {
-    int words = 0;
-    bool inWord = false;
-    for (char c : doc.text) {
-        bool space = c == ' ' || c == '\n';
-        if (!space && !inWord)
-            words++;
-        inWord = !space;
-    }
-    return words;
 }
 
 // ---- Input ----
@@ -249,9 +237,23 @@ void checkBattery(uint32_t now) {
         markChanged(now);
 }
 
-// The footer: problems first, then the Cmd+I status. Empty when all is well.
-void footer(char *out, size_t size) {
+int wordCount() {
+    int words = 0;
+    bool inWord = false;
+    for (char c : doc.text) {
+        bool space = c == ' ' || c == '\n';
+        if (!space && !inWord)
+            words++;
+        inWord = !space;
+    }
+    return words;
+}
+
+// The footer: problems first, then the Cmd+I status (file and words on the
+// left, saved state and power on the right). Empty when all is well.
+void footer(char *out, size_t size, char *right, size_t rightSize) {
     out[0] = 0;
+    right[0] = 0;
     tw::Keyboard::State kb = keyboard.state();
     if (doc.saveFailed) {
         snprintf(out, size, "Not saved: couldn’t write to flash. Cmd+S to retry.");
@@ -264,9 +266,10 @@ void footer(char *out, size_t size) {
     } else if (showStatus) {
         char battery[24] = "USB power";
         if (batteryPercent >= 0)
-            snprintf(battery, sizeof(battery), "battery %d%%", batteryPercent);
-        snprintf(out, size, "%s · %d words · %s · %s", doc.name.c_str(), wordCount(),
-                 doc.unsaved ? "not saved yet" : "saved", battery);
+            snprintf(battery, sizeof(battery), "Battery %d%%", batteryPercent);
+        int words = wordCount();
+        snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
+        snprintf(right, rightSize, "%s · %s", doc.unsaved ? "Not saved yet" : "Saved", battery);
     }
 }
 
@@ -275,11 +278,12 @@ bool footerChanged = false; // since the last render
 
 // Renders the writing page; returns true if the page turned.
 bool drawPage() {
-    char text[128];
-    footer(text, sizeof(text));
-    footerChanged = shownFooter != text;
-    shownFooter = text;
-    return page.render(doc.text, text);
+    char left[128], right[64];
+    footer(left, sizeof(left), right, sizeof(right));
+    std::string both = std::string(left) + "|" + right;
+    footerChanged = shownFooter != both;
+    shownFooter = both;
+    return page.render(doc.text, left, right);
 }
 
 void drawCentered(int32_t y, const char *s) {

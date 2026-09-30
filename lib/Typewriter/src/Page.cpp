@@ -101,7 +101,7 @@ void Page::showEnd(const std::string &text) {
     top_ = tail.empty() ? 0 : tail.front().start;
 }
 
-bool Page::render(const std::string &text, const char *footer) {
+bool Page::render(const std::string &text, const char *footerLeft, const char *footerRight) {
     const int32_t room = layout_.textBottom - layout_.marginTop;
     bool turned = false;
 
@@ -147,8 +147,14 @@ bool Page::render(const std::string &text, const char *footer) {
     const int16_t size = body_.yAdvance * 2 / 3; // font size in px (line spacing is 1.5)
     display_.fillRect(cursorX + 4, cursorY + size * 15 / 100, 3, size * 90 / 100, BLACK);
 
-    if (footer && *footer)
-        drawText(display_, small_, layout_.marginX, layout_.footerTop + smallAscent_, footer, 0, strlen(footer));
+    const int32_t baseline = layout_.footerTop + smallAscent_;
+    if (footerLeft && *footerLeft)
+        drawText(display_, small_, layout_.marginX, baseline, footerLeft, 0, strlen(footerLeft));
+    if (footerRight && *footerRight) {
+        size_t len = strlen(footerRight);
+        int32_t w = measure(small_, footerRight, 0, len);
+        drawText(display_, small_, display_.width() - layout_.marginX - w, baseline, footerRight, 0, len);
+    }
     return turned;
 }
 
