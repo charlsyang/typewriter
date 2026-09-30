@@ -11,6 +11,7 @@ const NimBLEUUID HID_SERVICE((uint16_t)0x1812);
 const NimBLEUUID PROTOCOL_MODE((uint16_t)0x2A4E);
 const NimBLEUUID REPORT((uint16_t)0x2A4D);
 const NimBLEUUID BOOT_KEYBOARD_INPUT((uint16_t)0x2A22);
+const NimBLEUUID REPORT_REFERENCE((uint16_t)0x2908);
 const uint16_t APPEARANCE_KEYBOARD = 0x03C1;
 
 // HID modifier bits.
@@ -140,10 +141,8 @@ bool translate(uint8_t usage, uint8_t mods, bool caps, KeyEvent &e) {
     return true;
 }
 
-// A boot-protocol keyboard report: modifiers, reserved, six key usages.
-void onKeyboardReport(const uint8_t *r) {
-    uint8_t mods = r[0];
-    const uint8_t *keys = r + 2;
+// A keyboard report: modifier bits and up to six pressed key usages.
+void onKeyboardReport(uint8_t mods, const uint8_t *keys) {
     uint32_t now = millis();
     for (int i = 0; i < 6; i++) {
         uint8_t k = keys[i];
@@ -180,18 +179,12 @@ void onKeyboardReport(const uint8_t *r) {
 }
 
 void onReport(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
-    // Log reports that aren't plain key presses (or any report with an unusual key).
-    bool plain = len == 8;
-    for (size_t i = 2; plain && i < 8; i++)
-        plain = data[i] == 0 || (data[i] >= KEY_A && data[i] <= 0x52);
-    if (!plain) {
-        Serial.printf("kbd: %u-byte report on handle %u:", (unsigned)len, chr->getHandle());
-        for (size_t i = 0; i < len; i++)
-            Serial.printf(" %02x", data[i]);
-        Serial.println();
-    }
+    // Boot format: modifiers, reserved, six keys. The MX Keys' report-protocol
+    // keyboard report leaves out the reserved byte.
     if (len == 8)
-        onKeyboardReport(data);
+        onKeyboardReport(data[0], data + 2);
+    else if (len == 7)
+        onKeyboardReport(data[0], data + 1);
 }
 
 class ScanCallbacks : public NimBLEScanCallbacks {
@@ -247,15 +240,54 @@ class ClientCallbacks : public NimBLEClientCallbacks {
 ScanCallbacks scanCallbacks;
 ClientCallbacks clientCallbacks;
 
-// Subscribes to key reports, preferring the fixed boot-protocol format.
+// Reports on channels other than the one we type from (media keys, Mac-specific
+// keys): read and ignored. The MX Keys Mini sends F10-F12 here; in boot
+// protocol it has nowhere to send them and stops sending anything at all.
+void onOtherReport(NimBLERemoteCharacteristic *chr, uint8_t *data, size_t len, bool isNotify) {
+}
+
+// Uses report protocol, as macOS and Windows do: the keyboard's own input
+// report (report ID 1, usually the same 8-byte layout as boot) plus every other
+// input report, except Logitech's HID++ channel. Falls back to boot protocol if
+// no keyboard report is found.
 bool subscribe() {
     NimBLERemoteService *hid = client->getService(HID_SERVICE);
     if (!hid) {
         Serial.println("kbd: no HID service");
         return false;
     }
-    NimBLERemoteCharacteristic *boot = hid->getCharacteristic(BOOT_KEYBOARD_INPUT);
     NimBLERemoteCharacteristic *mode = hid->getCharacteristic(PROTOCOL_MODE);
+    if (mode) {
+        uint8_t reportMode = 1;
+        mode->writeValue(&reportMode, 1, false);
+    }
+    bool haveKeyboard = false;
+    for (NimBLERemoteCharacteristic *chr : hid->getCharacteristics(true)) {
+        if (chr->getUUID() != REPORT || !chr->canNotify())
+            continue;
+        // Report Reference: {report ID, type (1 input, 2 output, 3 feature)}.
+        uint8_t id = 0, type = 0;
+        NimBLERemoteDescriptor *ref = chr->getDescriptor(REPORT_REFERENCE);
+        if (ref) {
+            NimBLEAttValue v = ref->readValue();
+            if (v.size() >= 2) {
+                id = v[0];
+                type = v[1];
+            }
+        }
+        // Report IDs 0x10-0x12 are Logitech HID++ (their Options app's channel).
+        bool hidpp = id >= 0x10 && id <= 0x12;
+        bool keys = id == 1;
+        bool ok = !hidpp && chr->subscribe(true, keys ? onReport : onOtherReport);
+        Serial.printf("kbd: report handle %u, id 0x%02x, type %u: %s\n", chr->getHandle(), id, type,
+                      hidpp ? "skipped (HID++)" : !ok ? "subscribe failed" : keys ? "keys" : "ignored");
+        haveKeyboard |= keys && ok;
+    }
+    if (haveKeyboard) {
+        Serial.println("kbd: using report protocol");
+        return true;
+    }
+    NimBLERemoteCharacteristic *boot = hid->getCharacteristic(BOOT_KEYBOARD_INPUT);
     if (boot && boot->canNotify() && mode) {
         uint8_t bootMode = 0;
         mode->writeValue(&bootMode, 1, false);
@@ -264,13 +296,7 @@ bool subscribe() {
             return true;
         }
     }
-    int count = 0;
-    for (NimBLERemoteCharacteristic *chr : hid->getCharacteristics(true)) {
-        if (chr->getUUID() == REPORT && chr->canNotify() && chr->subscribe(true, onReport))
-            count++;
-    }
-    Serial.printf("kbd: report protocol, %d input reports\n", count);
-    return count > 0;
+    return false;
 }
 
 void connectionTask(void *) {

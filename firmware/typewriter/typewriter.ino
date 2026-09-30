@@ -8,8 +8,8 @@
 // Cmd+I show status, Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
 //
-// Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, other bytes
-// type text. Serial logs events and timings.
+// Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
+// forgets the keyboard, other bytes type text. Serial logs events and timings.
 
 #include <Clock.h>
 #include <FastInkplate.h>
@@ -25,6 +25,7 @@ tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 tw::Keyboard keyboard;
 
 const uint32_t PASS_US = 20000;               // drive pass length chosen in Step 1
+const uint32_t FOOTER_PASS_US = 55000;        // library-length passes: erases notices cleanly
 const uint32_t POWER_OFF_AFTER_MS = 1500;     // keep the panel powered between keystrokes
 const uint32_t CLEAN_AFTER_IDLE_MS = 60000;   // full refresh after this long without typing
 const uint32_t SAVE_AFTER_IDLE_MS = 2000;     // autosave once typing pauses this long...
@@ -199,6 +200,11 @@ void handleSerial(uint32_t now) {
             }
             continue;
         }
+        if (b == 0x0B) { // Ctrl+K over USB: forget the keyboard
+            Serial.println("kbd: forgetting paired keyboards");
+            keyboard.forget();
+            continue;
+        }
         tw::KeyEvent e = {};
         if (b == 0x7F || b == 0x08) {
             e.type = tw::KeyEvent::Backspace;
@@ -264,10 +270,15 @@ void footer(char *out, size_t size) {
     }
 }
 
+std::string shownFooter;
+bool footerChanged = false; // since the last render
+
 // Renders the writing page; returns true if the page turned.
 bool drawPage() {
     char text[128];
     footer(text, sizeof(text));
+    footerChanged = shownFooter != text;
+    shownFooter = text;
     return page.render(doc.text, text);
 }
 
@@ -374,7 +385,9 @@ void loop() {
             Serial.printf("page turn: %lu ms\n", (unsigned long)(millis() - t0));
         } else {
             uint32_t t1 = millis();
-            display.quickPartialUpdate(true, PASS_US);
+            // Quick passes leave a faint trace when erasing, which is fine for a
+            // typo but not for a notice that should be gone.
+            display.quickPartialUpdate(true, footerChanged ? FOOTER_PASS_US : PASS_US);
             panelOn = true;
             partialsSinceClean = true;
             Serial.printf("partial: draw %lu ms, panel %lu ms, key waited %lu ms\n", (unsigned long)(t1 - t0),
