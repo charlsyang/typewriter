@@ -36,7 +36,7 @@ std::string merge(const std::string &remote, const std::string &local, size_t sy
     while (!merged.empty() && merged.back() == '\n')
         merged.pop_back();
     size_t start = 0;
-    while (start < added.size() && added[start] == '\n')
+    while (start < added.size() && (added[start] == '\n' || added[start] == ' '))
         start++;
     return merged + "\n\n" + added.substr(start);
 }
