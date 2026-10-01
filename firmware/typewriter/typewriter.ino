@@ -129,6 +129,8 @@ void save(const char *why) {
         dirty = true; // show the notice
 }
 
+extern size_t shortestSinceSnapshot;
+
 void edited(uint32_t now) {
     if (!doc.unsaved)
         doc.firstUnsavedAt = now;
@@ -136,24 +138,124 @@ void edited(uint32_t now) {
     // Remember how far Backspace reached into text Dropbox already has.
     if (doc.text.size() < doc.sync.keptLength)
         doc.sync.keptLength = doc.text.size();
+    if (doc.text.size() < shortestSinceSnapshot)
+        shortestSinceSnapshot = doc.text.size();
 }
 
 bool online() {
     return WiFi.status() == WL_CONNECTED;
 }
 
-// Brings the note and its Dropbox copy together. Blocks for a few seconds, so it
-// runs when you've paused (or asked with Cmd+S).
-void syncNow(const char *why) {
-    if (doc.remotePath.empty() || !online())
+// Sync runs in its own task, so typing never waits on the network. It works on
+// a snapshot of the note; text typed meanwhile stays local and goes up next time.
+struct SyncJob {
+    std::string localPath, remotePath;
+    std::string text;    // snapshot, replaced by the shared version if it changed
+    size_t snapshotSize; // bytes in the snapshot
+    tw::SyncState state;
+    tw::SyncResult result;
+    const char *why;
+    uint32_t startedAt;
+};
+SyncJob syncJob;
+volatile bool syncRunning = false;
+volatile bool syncDone = false;
+size_t shortestSinceSnapshot = 0; // Backspace below the snapshot while syncing
+TaskHandle_t syncTask;
+
+void syncTaskLoop(void *) {
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        syncJob.result = tw::syncFile(dropbox, syncJob.remotePath, syncJob.text, syncJob.state);
+        syncDone = true;
+    }
+}
+
+void startSync(const char *why) {
+    if (syncRunning || doc.remotePath.empty() || !online())
         return;
     save(why);
-    uint32_t t0 = millis();
-    doc.lastSyncAttemptAt = t0;
-    tw::SyncResult r = tw::syncFile(dropbox, doc.remotePath, doc.text, doc.sync);
+    syncJob.localPath = doc.path;
+    syncJob.remotePath = doc.remotePath;
+    syncJob.text = doc.text;
+    syncJob.snapshotSize = doc.text.size();
+    syncJob.state = doc.sync;
+    syncJob.why = why;
+    syncJob.startedAt = millis();
+    shortestSinceSnapshot = doc.text.size();
+    doc.lastSyncAttemptAt = syncJob.startedAt;
+    syncDone = false;
+    syncRunning = true;
+    xTaskNotifyGive(syncTask);
+}
+
+// Starts a background sync for a note other than the open one (e.g. yesterday's,
+// left unsynced while offline). Its text is read from flash.
+void startBacklogSync(const std::string &localPath, const std::string &remotePath) {
+    if (syncRunning || !online())
+        return;
+    syncJob.localPath = localPath;
+    syncJob.remotePath = remotePath;
+    if (!tw::storage::read(localPath.c_str(), syncJob.text))
+        return;
+    syncJob.snapshotSize = syncJob.text.size();
+    tw::loadSyncState(localPath, syncJob.state);
+    syncJob.why = "backlog";
+    syncJob.startedAt = millis();
+    syncDone = false;
+    syncRunning = true;
+    xTaskNotifyGive(syncTask);
+}
+
+// Looks for another daily note in flash with changes Dropbox doesn't have yet.
+bool findBacklog(std::string &localPath, std::string &remotePath) {
+    for (const std::string &name : tw::storage::list("/daily")) {
+        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".md") != 0 || name == "undated.md")
+            continue;
+        std::string path = "/daily/" + name;
+        if (path == doc.path)
+            continue;
+        // Only notes that have synced before: older notes written before sync
+        // existed are left for you to decide about.
+        tw::SyncState state;
+        if (!tw::loadSyncState(path, state) || state.rev.empty())
+            continue;
+        long size = tw::storage::size(path.c_str());
+        if (size >= 0 && (size_t)size != state.syncedLength) {
+            localPath = path;
+            remotePath = DAILY_NOTES + name;
+            return true;
+        }
+        if (state.keptLength < state.syncedLength) {
+            localPath = path;
+            remotePath = DAILY_NOTES + name;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Applies a finished sync to the note (or to the file it was for, if you've
+// moved on to another note since).
+void finishSync() {
+    if (!syncDone)
+        return;
+    syncDone = false;
+    syncRunning = false;
+    SyncJob &j = syncJob;
+    const tw::SyncResult &r = j.result;
     static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "FAILED"};
-    Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", why, OUTCOMES[r.outcome], (unsigned long)(millis() - t0),
-                  doc.sync.rev.c_str(), r.message.c_str());
+    Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", j.why, OUTCOMES[r.outcome],
+                  (unsigned long)(millis() - j.startedAt), j.state.rev.c_str(), r.message.c_str());
+
+    if (j.localPath != doc.path) {
+        if (r.outcome != tw::SyncResult::Failed) {
+            if (r.textChanged)
+                tw::storage::write(j.localPath.c_str(), j.text);
+            tw::saveSyncState(j.localPath, j.state);
+        }
+        return;
+    }
     if (r.outcome == tw::SyncResult::Failed) {
         doc.syncFailures++;
         doc.syncError = r.message;
@@ -163,12 +265,26 @@ void syncNow(const char *why) {
     doc.checkedRemote = true;
     doc.syncFailures = 0;
     doc.syncError.clear();
+
+    // What you typed while the sync ran: only additions, or did Backspace reach
+    // into the snapshot?
+    bool onlyAdded = shortestSinceSnapshot >= j.snapshotSize;
+    std::string typedSince = onlyAdded ? doc.text.substr(j.snapshotSize) : "";
     if (r.textChanged) {
-        doc.unsaved = true;
-        save("after sync");
-        page.showEnd(doc.text);
-        forceFull = true;
+        if (onlyAdded) {
+            doc.text = j.text + typedSince;
+            doc.sync = j.state;
+            doc.unsaved = true;
+            save("after sync");
+            page.showEnd(doc.text);
+            forceFull = true;
+        }
+        // Otherwise keep your text and the old sync state: the next sync sees
+        // Dropbox's new version and merges (or saves a conflicted copy).
     } else {
+        doc.sync = j.state; // agreed on the snapshot
+        if (!onlyAdded)
+            doc.sync.keptLength = shortestSinceSnapshot;
         tw::saveSyncState(doc.path, doc.sync);
     }
     if (r.outcome == tw::SyncResult::Conflict)
@@ -235,7 +351,7 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
             else if (!online())
                 notice = "Saved on the Inkplate. It will sync when Wi-Fi is back.";
             else
-                syncNow("Cmd+S");
+                startSync("Cmd+S");
             markChanged(now);
         } else if (e.key == 'i') {
             showStatus = true;
@@ -358,6 +474,7 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
         const char *state = doc.unsaved                              ? "Not saved yet"
                             : doc.remotePath.empty()                 ? "Saved"
+                            : syncRunning                            ? "Syncing…"
                             : !tw::hasLocalChanges(doc.text, doc.sync) && doc.checkedRemote ? "Synced"
                             : online()                               ? "Saved, not synced yet"
                                                                      : "Saved, offline";
@@ -427,6 +544,7 @@ void setup() {
     tw::wallclock::begin(display);
     openToday();
     keyboard.begin("Typewriter");
+    xTaskCreatePinnedToCore(syncTaskLoop, "sync", 12288, nullptr, 1, &syncTask, 0);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -461,11 +579,14 @@ void loop() {
 
     checkBattery(now);
     checkNetworkClock();
+    finishSync();
 
     bool idle = now - lastKeyAt > SYNC_AFTER_IDLE_MS;
     // A new day: once you pause, move on to the new daily note.
-    if (idle && tw::wallclock::isSet() && doc.remotePath.rfind(DAILY_NOTES, 0) == 0 && todayName() != doc.name) {
-        syncNow("day ended");
+    if (idle && !syncRunning && tw::wallclock::isSet() && doc.remotePath.rfind(DAILY_NOTES, 0) == 0 &&
+        todayName() != doc.name) {
+        // The sync finishes in the background against yesterday's file.
+        startSync("day ended");
         save("day ended");
         openToday();
     }
@@ -473,7 +594,15 @@ void loop() {
     bool retryWait = doc.syncFailures && now - doc.lastSyncAttemptAt < SYNC_RETRY_MS;
     if (online() && !retryWait && !doc.remotePath.empty()) {
         if (!doc.checkedRemote || (idle && tw::hasLocalChanges(doc.text, doc.sync)))
-            syncNow(doc.checkedRemote ? "idle" : "open");
+            startSync(doc.checkedRemote ? "idle" : "open");
+    }
+    // Then catch up on other notes left unsynced, one at a time, while you pause.
+    static uint32_t lastBacklogCheckAt = 0;
+    if (idle && online() && !syncRunning && doc.checkedRemote && now - lastBacklogCheckAt > SYNC_RETRY_MS) {
+        lastBacklogCheckAt = now;
+        std::string local, remote;
+        if (findBacklog(local, remote))
+            startBacklogSync(local, remote);
     }
 
     // Keyboard state changes: the pairing screen, or the footer notice.

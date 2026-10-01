@@ -58,6 +58,27 @@ bool write(const char *path, const std::string &data) {
     return LittleFS.rename(tmp.c_str(), path);
 }
 
+std::vector<std::string> list(const char *dir) {
+    std::vector<std::string> names;
+    File d = LittleFS.open(dir);
+    if (!d || !d.isDirectory())
+        return names;
+    for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+        if (!f.isDirectory())
+            names.push_back(f.name());
+    }
+    return names;
+}
+
+long size(const char *path) {
+    File f = LittleFS.open(path, "r");
+    if (!f)
+        return -1;
+    long n = f.size();
+    f.close();
+    return n;
+}
+
 size_t usedBytes() {
     return LittleFS.usedBytes();
 }
