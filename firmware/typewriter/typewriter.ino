@@ -1,28 +1,39 @@
 // Typewriter: write into today's daily note on a Bluetooth keyboard.
 //
 // The note lives in flash at /daily/YYYY-MM-DD.md (the Obsidian daily note name)
-// and autosaves a couple of seconds after you stop typing. The screen shows only
-// your text; a footer line appears when something needs attention, or on Cmd+I.
+// and autosaves a couple of seconds after you stop typing. Over Wi-Fi it syncs
+// with /OS/Daily Notes/YYYY-MM-DD.md in Dropbox: when the note opens, after a
+// minute without typing, and on Cmd+S. The screen shows only your text; a footer
+// line appears when something needs attention, or on Cmd+I.
 //
-// Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save now,
+// Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
+//
+// Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save and sync,
 // Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
 // forgets the keyboard, other bytes type text. Serial logs events and timings.
 
+#include "secrets.h"
+
 #include <Clock.h>
+#include <Dropbox.h>
 #include <FastInkplate.h>
 #include <Keyboard.h>
 #include <Page.h>
 #include <Storage.h>
+#include <Sync.h>
 #include <Text.h>
+#include <WiFi.h>
+#include <esp_sntp.h>
 #include <fonts/Duo24.h>
 #include <fonts/Duo40.h>
 
 tw::FastInkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 tw::Keyboard keyboard;
+tw::Dropbox dropbox(DROPBOX_APP_KEY, DROPBOX_REFRESH_TOKEN);
 
 const uint32_t PASS_US = 20000;               // drive pass length chosen in Step 1
 const uint32_t FOOTER_PASS_US = 55000;        // library-length passes: erases notices cleanly
@@ -30,16 +41,26 @@ const uint32_t POWER_OFF_AFTER_MS = 1500;     // keep the panel powered between 
 const uint32_t CLEAN_AFTER_IDLE_MS = 60000;   // full refresh after this long without typing
 const uint32_t SAVE_AFTER_IDLE_MS = 2000;     // autosave once typing pauses this long...
 const uint32_t SAVE_AT_LEAST_EVERY_MS = 30000; // ...or at least this often while typing
+const uint32_t SYNC_AFTER_IDLE_MS = 60000;    // sync once typing pauses this long
+const uint32_t SYNC_RETRY_MS = 120000;        // wait this long after a failed sync
+const int SYNC_FAILURES_BEFORE_NOTICE = 3;
+const char *DAILY_NOTES = "/OS/Daily Notes/"; // in Dropbox
 const uint32_t BATTERY_CHECK_EVERY_MS = 60000;
 const int LOW_BATTERY_PERCENT = 15;
 
 struct Document {
-    std::string path; // in flash, e.g. /daily/2026-09-29.md
-    std::string name; // shown to you, e.g. 2026-09-29.md
+    std::string path;       // in flash, e.g. /daily/2026-09-29.md
+    std::string remotePath; // in Dropbox, e.g. /OS/Daily Notes/2026-09-29.md ("" = don't sync)
+    std::string name;       // shown to you, e.g. 2026-09-29.md
     std::string text;
     bool unsaved = false;
     bool saveFailed = false;
     uint32_t firstUnsavedAt = 0;
+    tw::SyncState sync;
+    bool checkedRemote = false; // synced at least once since opening
+    int syncFailures = 0;       // in a row
+    uint32_t lastSyncAttemptAt = 0;
+    std::string syncError;
 };
 
 Document doc;
@@ -55,36 +76,49 @@ uint32_t firstUnshownKeyAt = 0;
 uint32_t seenKeyboardRevision = UINT32_MAX;
 int batteryPercent = -1; // -1: no battery reading
 uint32_t lastBatteryCheckAt = 0;
+std::string notice;      // one-off message, cleared by the next key
+bool clockFromNetwork = false;
 
 // ---- Document ----
 
-void openDocument(const char *path, const char *name) {
+void openDocument(const std::string &path, const std::string &remotePath, const std::string &name) {
     doc = Document();
     doc.path = path;
+    doc.remotePath = remotePath;
     doc.name = name;
-    if (tw::storage::exists(path) && !tw::storage::read(path, doc.text))
-        Serial.printf("open: couldn't read %s\n", path);
+    if (tw::storage::exists(path.c_str()) && !tw::storage::read(path.c_str(), doc.text))
+        Serial.printf("open: couldn't read %s\n", path.c_str());
+    if (!tw::loadSyncState(path, doc.sync)) {
+        // Never synced: everything here is new to Dropbox.
+        doc.sync = tw::SyncState();
+    }
     page.showEnd(doc.text);
     forceFull = true;
-    Serial.printf("open: %s (%u bytes)\n", path, (unsigned)doc.text.size());
+    Serial.printf("open: %s (%u bytes, synced rev %s)\n", path.c_str(), (unsigned)doc.text.size(),
+                  doc.sync.rev.empty() ? "none" : doc.sync.rev.c_str());
+}
+
+std::string todayName() {
+    char date[11];
+    if (tw::wallclock::isSet())
+        tw::wallclock::today(date);
+    else
+        strcpy(date, "undated");
+    return std::string(date) + ".md";
 }
 
 void openToday() {
-    char date[11];
-    if (tw::wallclock::isSet()) {
-        tw::wallclock::today(date);
-    } else {
-        strcpy(date, "undated");
-    }
-    std::string name = std::string(date) + ".md";
-    openDocument(("/daily/" + name).c_str(), name.c_str());
+    std::string name = todayName();
+    // An undated note stays on the Inkplate: it would collide across days.
+    std::string remote = tw::wallclock::isSet() ? DAILY_NOTES + name : "";
+    openDocument("/daily/" + name, remote, name);
 }
 
 void save(const char *why) {
     if (!doc.unsaved)
         return;
     uint32_t t0 = millis();
-    bool ok = tw::storage::write(doc.path.c_str(), doc.text);
+    bool ok = tw::storage::write(doc.path.c_str(), doc.text) && tw::saveSyncState(doc.path, doc.sync);
     doc.saveFailed = !ok;
     doc.unsaved = !ok;
     if (ok)
@@ -99,6 +133,48 @@ void edited(uint32_t now) {
     if (!doc.unsaved)
         doc.firstUnsavedAt = now;
     doc.unsaved = true;
+    // Remember how far Backspace reached into text Dropbox already has.
+    if (doc.text.size() < doc.sync.keptLength)
+        doc.sync.keptLength = doc.text.size();
+}
+
+bool online() {
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// Brings the note and its Dropbox copy together. Blocks for a few seconds, so it
+// runs when you've paused (or asked with Cmd+S).
+void syncNow(const char *why) {
+    if (doc.remotePath.empty() || !online())
+        return;
+    save(why);
+    uint32_t t0 = millis();
+    doc.lastSyncAttemptAt = t0;
+    tw::SyncResult r = tw::syncFile(dropbox, doc.remotePath, doc.text, doc.sync);
+    static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "FAILED"};
+    Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", why, OUTCOMES[r.outcome], (unsigned long)(millis() - t0),
+                  doc.sync.rev.c_str(), r.message.c_str());
+    if (r.outcome == tw::SyncResult::Failed) {
+        doc.syncFailures++;
+        doc.syncError = r.message;
+        dirty = true;
+        return;
+    }
+    doc.checkedRemote = true;
+    doc.syncFailures = 0;
+    doc.syncError.clear();
+    if (r.textChanged) {
+        doc.unsaved = true;
+        save("after sync");
+        page.showEnd(doc.text);
+        forceFull = true;
+    } else {
+        tw::saveSyncState(doc.path, doc.sync);
+    }
+    if (r.outcome == tw::SyncResult::Conflict)
+        notice = "Changed on both sides. Your Inkplate version is in Dropbox as " +
+                 r.message.substr(r.message.rfind('/') + 1);
+    dirty = true;
 }
 
 void deleteLastChar() {
@@ -128,8 +204,9 @@ void markChanged(uint32_t now) {
 
 void handleKey(const tw::KeyEvent &e, uint32_t now) {
     lastKeyAt = now;
-    if (showStatus) {
+    if (showStatus || !notice.empty()) {
         showStatus = false;
+        notice.clear();
         markChanged(now);
     }
     switch (e.type) {
@@ -153,6 +230,12 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
     case tw::KeyEvent::Shortcut:
         if (e.key == 's') {
             save("Cmd+S");
+            if (doc.remotePath.empty())
+                notice = "Saved on the Inkplate. Undated notes don't sync.";
+            else if (!online())
+                notice = "Saved on the Inkplate. It will sync when Wi-Fi is back.";
+            else
+                syncNow("Cmd+S");
             markChanged(now);
         } else if (e.key == 'i') {
             showStatus = true;
@@ -257,6 +340,10 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
     tw::Keyboard::State kb = keyboard.state();
     if (doc.saveFailed) {
         snprintf(out, size, "Not saved: couldn’t write to flash. Cmd+S to retry.");
+    } else if (!notice.empty()) {
+        snprintf(out, size, "%s", notice.c_str());
+    } else if (doc.syncFailures >= SYNC_FAILURES_BEFORE_NOTICE) {
+        snprintf(out, size, "Can’t sync with Dropbox (%s). Saved on the Inkplate.", doc.syncError.c_str());
     } else if (kb == tw::Keyboard::State::Searching || kb == tw::Keyboard::State::Connecting) {
         snprintf(out, size, "Keyboard not connected. Press a key on it to wake it.");
     } else if (!tw::wallclock::isSet()) {
@@ -269,7 +356,12 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
             snprintf(battery, sizeof(battery), "Battery %d%%", batteryPercent);
         int words = wordCount();
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
-        snprintf(right, rightSize, "%s · %s", doc.unsaved ? "Not saved yet" : "Saved", battery);
+        const char *state = doc.unsaved                              ? "Not saved yet"
+                            : doc.remotePath.empty()                 ? "Saved"
+                            : !tw::hasLocalChanges(doc.text, doc.sync) && doc.checkedRemote ? "Synced"
+                            : online()                               ? "Saved, not synced yet"
+                                                                     : "Saved, offline";
+        snprintf(right, rightSize, "%s · %s", state, battery);
     }
 }
 
@@ -335,6 +427,24 @@ void setup() {
     tw::wallclock::begin(display);
     openToday();
     keyboard.begin("Typewriter");
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    configTzTime(tw::wallclock::zone().c_str(), "pool.ntp.org", "time.apple.com");
+}
+
+// Once Wi-Fi has the time, keep the RTC right (and leave undated.md behind).
+void checkNetworkClock() {
+    if (clockFromNetwork || sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED)
+        return;
+    clockFromNetwork = true;
+    bool wasSet = tw::wallclock::isSet();
+    tw::wallclock::set(display, time(nullptr), tw::wallclock::zone().c_str());
+    Serial.printf("clock: set from the network\n");
+    if (!wasSet) {
+        save("clock set");
+        openToday();
+    }
 }
 
 void loop() {
@@ -350,6 +460,21 @@ void loop() {
         save("auto");
 
     checkBattery(now);
+    checkNetworkClock();
+
+    bool idle = now - lastKeyAt > SYNC_AFTER_IDLE_MS;
+    // A new day: once you pause, move on to the new daily note.
+    if (idle && tw::wallclock::isSet() && doc.remotePath.rfind(DAILY_NOTES, 0) == 0 && todayName() != doc.name) {
+        syncNow("day ended");
+        save("day ended");
+        openToday();
+    }
+    // Sync: when the note opens (to pick up laptop edits), then after pauses.
+    bool retryWait = doc.syncFailures && now - doc.lastSyncAttemptAt < SYNC_RETRY_MS;
+    if (online() && !retryWait && !doc.remotePath.empty()) {
+        if (!doc.checkedRemote || (idle && tw::hasLocalChanges(doc.text, doc.sync)))
+            syncNow(doc.checkedRemote ? "idle" : "open");
+    }
 
     // Keyboard state changes: the pairing screen, or the footer notice.
     uint32_t rev = keyboard.revision();

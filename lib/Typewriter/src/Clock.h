@@ -21,6 +21,9 @@ void set(Inkplate &display, uint32_t epoch, const char *tz);
 // Today's local date as "YYYY-MM-DD" (buffer of at least 11 bytes).
 void today(char *out);
 
+// The saved POSIX time zone string.
+String zone();
+
 } // namespace wallclock
 
 } // namespace tw

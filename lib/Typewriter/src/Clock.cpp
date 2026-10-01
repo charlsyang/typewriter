@@ -56,6 +56,14 @@ void set(Inkplate &display, uint32_t epoch, const char *tz) {
     rtcSet = true;
 }
 
+String zone() {
+    Preferences prefs;
+    prefs.begin("clock", true);
+    String tz = prefs.getString("tz", "UTC0");
+    prefs.end();
+    return tz;
+}
+
 void today(char *out) {
     time_t now = time(nullptr);
     tm local;

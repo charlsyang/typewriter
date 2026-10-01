@@ -3,3 +3,9 @@ build/
 secrets.h
 tools/.venv/
 sketches/step1_font_preview/previews.h
+.pio/
+.dummy/
+managed_components/
+sdkconfig.defaults
+sdkconfig.inkplate5v2
+dependencies.lock
