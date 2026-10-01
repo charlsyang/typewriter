@@ -1,11 +1,12 @@
 // A small Dropbox API v2 client: the handful of calls the typewriter needs.
 //
 // Authenticates with a long-lived refresh token (tools/dropbox_auth.py) and
-// keeps the short-lived access token it trades it for. Calls block for about a
-// second each (TLS over Wi-Fi), so call them when the writer has paused.
+// keeps the short-lived access token it trades it for. Connections stay open
+// between calls; still, calls block, so make them from a background task.
 #pragma once
 
 #include <Arduino.h>
+#include <NetworkClientSecure.h>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,8 @@ class Dropbox {
     const std::string &lastError() const { return lastError_; }
 
   private:
+    NetworkClientSecure &connection(bool content);
+    static std::string tlsError(NetworkClientSecure &tls);
     bool ensureToken();
     Result call(const char *host, const char *endpoint, const std::string &arg, const std::string *body,
                 std::string &response, std::string *apiResult);
@@ -59,6 +62,8 @@ class Dropbox {
     std::string accessToken_;
     uint32_t tokenExpiresAt_ = 0; // millis()
     std::string lastError_;
+    NetworkClientSecure *apiTls_ = nullptr;     // api.dropboxapi.com
+    NetworkClientSecure *contentTls_ = nullptr; // content.dropboxapi.com
 };
 
 } // namespace tw

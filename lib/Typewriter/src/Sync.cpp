@@ -81,6 +81,22 @@ SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string
     };
 
     bool localChanges = hasLocalChanges(text, state);
+
+    // The common case: you typed, the laptop didn't touch the file. One request:
+    // Dropbox only accepts the upload if the file is still at our revision.
+    if (localChanges && !state.rev.empty()) {
+        std::string rev;
+        Dropbox::Result u = dropbox.upload(remotePath, text, state.rev, rev);
+        if (u == Dropbox::Result::Ok) {
+            agreed(rev);
+            result.outcome = SyncResult::Uploaded;
+            return result;
+        }
+        if (u == Dropbox::Result::Error)
+            return fail("uploading");
+        // Conflict or gone: look at what Dropbox has and merge below.
+    }
+
     Dropbox::Entry remote;
     Dropbox::Result r = dropbox.metadata(remotePath, remote);
     if (r == Dropbox::Result::Error)

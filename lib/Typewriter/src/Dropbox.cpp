@@ -67,28 +67,46 @@ void readEntry(JsonObjectConst o, Dropbox::Entry &e) {
 Dropbox::Dropbox(const char *appKey, const char *refreshToken) : appKey_(appKey), refreshToken_(refreshToken) {
 }
 
+// One secure connection per Dropbox host, kept open between requests (HTTP
+// keep-alive): each new TLS handshake costs 2-3 seconds on the ESP32.
+NetworkClientSecure &Dropbox::connection(bool content) {
+    NetworkClientSecure *&tls = content ? contentTls_ : apiTls_;
+    if (!tls) {
+        tls = new NetworkClientSecure();
+        tls->useBuiltinCACertBundle(); // Mozilla roots bundled with ESP-IDF
+    }
+    return *tls;
+}
+
+std::string Dropbox::tlsError(NetworkClientSecure &tls) {
+    char text[96] = "";
+    tls.lastError(text, sizeof(text));
+    return text;
+}
+
 bool Dropbox::ensureToken() {
     if (!accessToken_.empty() && (int32_t)(tokenExpiresAt_ - millis()) > 60000)
         return true;
-    NetworkClientSecure tls;
-    tls.useBuiltinCACertBundle(); // Mozilla roots bundled with ESP-IDF
-    HTTPClient http;
-    if (!http.begin(tls, "https://api.dropboxapi.com/oauth2/token")) {
-        lastError_ = "couldn't reach Dropbox";
-        return false;
-    }
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
     String body = String("grant_type=refresh_token&refresh_token=") + refreshToken_.c_str() +
                   "&client_id=" + appKey_.c_str();
-    int code = http.POST(body);
-    String response = http.getString();
-    http.end();
+    NetworkClientSecure &tls = connection(false);
+    int code = -1;
+    String response;
+    for (int attempt = 0; attempt < 2 && code < 0; attempt++) {
+        HTTPClient http;
+        http.setReuse(true);
+        if (!http.begin(tls, "https://api.dropboxapi.com/oauth2/token"))
+            continue;
+        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+        code = http.POST(body);
+        response = http.getString();
+        http.end();
+        if (code < 0)
+            tls.stop(); // a kept-alive connection the server had closed: retry fresh
+    }
     if (code != 200) {
-        char tlsError[96] = "";
-        tls.lastError(tlsError, sizeof(tlsError));
-        lastError_ = "sign-in failed (" + std::to_string(code) + (tlsError[0] ? std::string(", ") + tlsError : "") + ")";
-        Serial.printf("dropbox: %s; heap free %u, largest block %u\n", lastError_.c_str(), (unsigned)ESP.getFreeHeap(),
-                      (unsigned)ESP.getMaxAllocHeap());
+        std::string tlsText = code < 0 ? tlsError(tls) : "";
+        lastError_ = "sign-in failed (" + std::to_string(code) + (tlsText.empty() ? "" : ", " + tlsText) + ")";
         return false;
     }
     JsonDocument doc;
@@ -108,40 +126,42 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
     if (!ensureToken())
         return Result::Error;
     bool content = strcmp(host, "content.dropboxapi.com") == 0;
-    NetworkClientSecure tls;
-    tls.useBuiltinCACertBundle(); // Mozilla roots bundled with ESP-IDF
-    HTTPClient http;
+    NetworkClientSecure &tls = connection(content);
     String url = String("https://") + host + "/2/" + endpoint;
-    if (!http.begin(tls, url)) {
-        lastError_ = "couldn't reach Dropbox";
-        return Result::Error;
-    }
-    http.setTimeout(15000);
-    http.addHeader("Authorization", String("Bearer ") + accessToken_.c_str());
-    const char *collect[] = {"Dropbox-API-Result"};
-    http.collectHeaders(collect, 1);
-    int code;
-    if (content) {
-        http.addHeader("Dropbox-API-Arg", arg.c_str());
-        if (body) {
-            http.addHeader("Content-Type", "application/octet-stream");
-            code = http.POST((uint8_t *)body->data(), body->size());
+    int code = -1;
+    for (int attempt = 0; attempt < 2 && code < 0; attempt++) {
+        HTTPClient http;
+        http.setReuse(true);
+        if (!http.begin(tls, url))
+            continue;
+        http.setTimeout(15000);
+        http.addHeader("Authorization", String("Bearer ") + accessToken_.c_str());
+        const char *collect[] = {"Dropbox-API-Result"};
+        http.collectHeaders(collect, 1);
+        if (content) {
+            http.addHeader("Dropbox-API-Arg", arg.c_str());
+            if (body) {
+                http.addHeader("Content-Type", "application/octet-stream");
+                code = http.POST((uint8_t *)body->data(), body->size());
+            } else {
+                code = http.POST((uint8_t *)nullptr, 0);
+            }
         } else {
-            code = http.POST((uint8_t *)nullptr, 0);
+            http.addHeader("Content-Type", "application/json");
+            code = http.POST((uint8_t *)arg.data(), arg.size());
         }
-    } else {
-        http.addHeader("Content-Type", "application/json");
-        code = http.POST((uint8_t *)arg.data(), arg.size());
+        response.clear();
+        if (code > 0) {
+            // getString() handles chunked replies; text files hold no NUL bytes.
+            String s = http.getString();
+            response.assign(s.c_str(), s.length());
+            if (apiResult)
+                *apiResult = http.header("Dropbox-API-Result").c_str();
+        }
+        http.end();
+        if (code < 0)
+            tls.stop(); // a kept-alive connection the server had closed: retry fresh
     }
-    response.clear();
-    if (code > 0) {
-        // getString() handles chunked replies; text files hold no NUL bytes.
-        String s = http.getString();
-        response.assign(s.c_str(), s.length());
-        if (apiResult)
-            *apiResult = http.header("Dropbox-API-Result").c_str();
-    }
-    http.end();
 
     if (code == 200)
         return Result::Ok;
@@ -156,15 +176,12 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
     }
     lastError_ = std::string(endpoint) + " failed (" + std::to_string(code) + ")";
     if (code < 0) {
-        char tlsError[96] = "";
-        tls.lastError(tlsError, sizeof(tlsError));
-        if (tlsError[0])
-            lastError_ += std::string(": ") + tlsError;
-        Serial.printf("dropbox: %s; heap free %u, largest block %u\n", lastError_.c_str(), (unsigned)ESP.getFreeHeap(),
-                      (unsigned)ESP.getMaxAllocHeap());
-    }
-    if (code > 0 && !response.empty())
+        std::string tlsText = tlsError(tls);
+        if (!tlsText.empty())
+            lastError_ += ": " + tlsText;
+    } else if (!response.empty()) {
         lastError_ += ": " + response.substr(0, 120);
+    }
     return Result::Error;
 }
 
