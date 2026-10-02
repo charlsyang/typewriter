@@ -6,6 +6,10 @@
 // minute without typing, and on Cmd+S. The screen shows only your text; a footer
 // line appears when something needs attention, or on Cmd+I.
 //
+// After 10 minutes without typing it saves, syncs and deep-sleeps, leaving the
+// page on screen; the WAKE button resumes where you were. Switching on starts at
+// the list.
+//
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
 // Cmd+O lists today's note and your drafts (essays in /Site/blog without
@@ -53,6 +57,9 @@ const uint32_t SYNC_RETRY_MS = 120000;        // wait this long after a failed s
 const int SYNC_FAILURES_BEFORE_NOTICE = 3;
 const char *DAILY_NOTES = "/OS/Daily Notes/"; // in Dropbox
 const char *ESSAYS = "/Site/blog";            // in Dropbox
+const uint32_t SLEEP_AFTER_IDLE_MS = 10 * 60 * 1000; // deep sleep after this long without typing
+const gpio_num_t WAKE_BUTTON = GPIO_NUM_36;           // the board's WAKE button
+const char *ASLEEP = "Asleep · press WAKE to continue";
 const uint32_t BATTERY_CHECK_EVERY_MS = 60000;
 const int LOW_BATTERY_PERCENT = 15;
 
@@ -97,6 +104,11 @@ struct SyncJob {
     const char *why;
     uint32_t startedAt;
 };
+
+// Kept in RTC memory through deep sleep, so waking returns to the same screen.
+RTC_DATA_ATTR bool resumeAfterSleep = false;
+RTC_DATA_ATTR bool resumeOnList = false;
+void goToSleep(uint32_t wakeAfterSeconds = 0);
 
 Document doc;
 uint32_t lastKeyAt = 0;
@@ -762,7 +774,7 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        if (b == 0x12) { // Ctrl+R over USB, then "ls" or "rm <path>": manage files in flash
+        if (b == 0x12) { // Ctrl+R over USB, then "ls", "rm <path>" or "sleep [seconds]"
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line == "ls") {
@@ -772,6 +784,8 @@ void handleSerial(uint32_t now) {
                         Serial.printf("file: %s (%ld bytes)\n", path.c_str(), tw::storage::size(path.c_str()));
                     }
                 }
+            } else if (line.startsWith("sleep")) { // "sleep <seconds>": sleep now, wake on a timer
+                goToSleep(line.length() > 6 ? line.substring(6).toInt() : 0);
             } else if (line.startsWith("rm ")) {
                 std::string path = line.substring(3).c_str();
                 bool ok = tw::storage::remove(path.c_str());
@@ -952,7 +966,7 @@ void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std
 }
 
 // The daily note, then a "Drafts" section. Drafts scroll; the daily note stays put.
-void drawOpenScreen() {
+void drawOpenScreen(const char *hintOverride = nullptr) {
     const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
     const int16_t labelY = top + rowH + 48;         // section label, after a gap
     const int16_t listTop = labelY + 60;             // first draft row
@@ -981,7 +995,7 @@ void drawOpenScreen() {
         drawOpenRow(listTop + (i - firstVisible) * rowH, selected == i + 1, essayTitle(drafts[i].name),
                     numericDate(drafts[i].modified));
 
-    const char *hint = "↑↓ choose · Return open · Esc back";
+    const char *hint = hintOverride ? hintOverride : "↑↓ choose · Return open · Esc back";
     tw::drawText(display, Duo24, marginX, 720 - 44 + Duo24Ascent, hint, 0, strlen(hint));
 }
 
@@ -993,6 +1007,42 @@ void fullRefresh(const char *why) {
     panelOn = false;
     lastUpdateAt = millis();
     Serial.printf("full refresh (%s): %lu ms\n", why, (unsigned long)(lastUpdateAt - t0));
+}
+
+// ---- Sleep ----
+
+// Waits (up to a limit) for the background task to go idle.
+void waitForBackground(uint32_t limitMs) {
+    uint32_t start = millis();
+    while (syncRunning && !syncDone && millis() - start < limitMs)
+        delay(50);
+    finishSync();
+}
+
+// Saves, syncs what it can, leaves the current screen up with a small note, and
+// sleeps until the WAKE button. Waking restarts the program; setup() resumes.
+void goToSleep(uint32_t wakeAfterSeconds) {
+    Serial.println("sleep: going to sleep");
+    save("sleep");
+    waitForBackground(30000);
+    if (online() && !doc.remotePath.empty() && tw::hasLocalChanges(doc.text, doc.sync)) {
+        startSync("sleep");
+        waitForBackground(30000);
+    }
+    resumeAfterSleep = true;
+    resumeOnList = screen == Screen::Open;
+    // A full refresh: the resting image should be clean, with no ghosting.
+    if (screen == Screen::Open)
+        drawOpenScreen(ASLEEP);
+    else
+        page.render(doc.text, ASLEEP, nullptr);
+    display.display();
+    display.einkOff();
+    WiFi.disconnect(true);
+    esp_sleep_enable_ext0_wakeup(WAKE_BUTTON, 0);
+    if (wakeAfterSeconds) // testing over USB
+        esp_sleep_enable_timer_wakeup((uint64_t)wakeAfterSeconds * 1000000ULL);
+    esp_deep_sleep_start(); // does not return
 }
 
 // ---- Main ----
@@ -1017,20 +1067,33 @@ void setup() {
         openEssay(essay.c_str());
     else
         openToday();
-    // Switching on starts at the list, with that note selected. (Waking from
-    // sleep, once there is sleep, should return to the screen you left.)
-    showOpenScreen();
+    // Waking from sleep returns to the screen you left; switching on starts at
+    // the list, with that note selected.
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    bool woke = (cause == ESP_SLEEP_WAKEUP_EXT0 || cause == ESP_SLEEP_WAKEUP_TIMER) && resumeAfterSleep;
+    Serial.printf("start: %s\n", woke ? (resumeOnList ? "woke, back to the list" : "woke, back to writing") : "power on");
+    if (!woke || resumeOnList)
+        showOpenScreen();
+    resumeAfterSleep = false;
+    lastKeyAt = millis(); // the sleep timer starts now
     keyboard.begin("Typewriter");
     xTaskCreatePinnedToCore(syncTaskLoop, "sync", 12288, nullptr, 1, &syncTask, 0);
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    configTzTime(tw::wallclock::zone().c_str(), "pool.ntp.org", "time.apple.com");
 }
 
 // Once Wi-Fi has the time, keep the RTC right (and leave undated.md behind).
 void checkNetworkClock() {
-    if (clockFromNetwork || sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED)
+    static bool started = false;
+    if (!started && online()) {
+        // Started only once Wi-Fi is up, with servers given by IP address (Google
+        // Public NTP): if a name lookup fails, lwIP's SNTP retry asserts and
+        // restarts the board.
+        started = true;
+        configTzTime(tw::wallclock::zone().c_str(), "216.239.35.0", "216.239.35.4");
+    }
+    if (clockFromNetwork || !started || sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED)
         return;
     clockFromNetwork = true;
     bool wasSet = tw::wallclock::isSet();
@@ -1057,6 +1120,9 @@ void loop() {
     checkBattery(now);
     checkNetworkClock();
     finishSync();
+
+    if (now - lastKeyAt > SLEEP_AFTER_IDLE_MS && !showingPairing)
+        goToSleep();
 
     bool idle = now - lastKeyAt > SYNC_AFTER_IDLE_MS;
     // A new day: once you pause, move on to the new daily note.
