@@ -48,11 +48,24 @@ class Page {
     // The lines that fit on screen, ending with the line that holds the end of the text.
     std::vector<Line> visibleLines(const std::string &text) const;
 
+    // Reading back: the document split into pages from the start, each repeating
+    // the last carryLines of the one before, up to the page you're writing on.
+    struct Reading {
+        std::vector<Line> lines;  // the whole document, wrapped
+        std::vector<size_t> starts; // first line of each page before the writing page
+    };
+    Reading readingPages(const std::string &text) const;
+
+    // Draws one reading page (no cursor). The caller does a full refresh.
+    void renderReading(const std::string &text, const Reading &reading, size_t page, const char *footerLeft,
+                       const char *footerRight);
+
   private:
     void wrapParagraph(const std::string &text, size_t start, size_t end, std::vector<Line> &out) const;
     std::vector<Line> linesFrom(const std::string &text, size_t top) const;
     int32_t height(const std::vector<Line> &lines) const;
     int16_t lineHeight(const Line &line) const;
+    size_t pageEnd(const std::vector<Line> &lines, size_t start) const; // one past the last line that fits
     void clearRows(int32_t y0, int32_t y1);
 
     Inkplate &display_;

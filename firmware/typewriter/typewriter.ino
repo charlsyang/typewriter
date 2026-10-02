@@ -16,7 +16,8 @@
 // isPublished: true), all kept on the Inkplate; Cmd+D returns to today's note.
 // Drafts sync the same way. Daily notes that are blank never go to Dropbox.
 //
-// Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+Z undo and
+// ↑/↓ read back through earlier pages (full refresh each); typing returns to the
+// end. Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+Z undo and
 // Cmd+Shift+Z redo (typing or deleting), Cmd+S save and sync,
 // Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
@@ -47,6 +48,13 @@ tw::FastInkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 tw::Keyboard keyboard;
 tw::History history; // Cmd+Z / Cmd+Shift+Z for the open document
+
+// Reading back with ↑/↓: a page at a time, each a full refresh. Typing anything
+// returns to the end and types there, so it stays a typewriter.
+bool reading = false;
+tw::Page::Reading readingPages;
+size_t readingPage = 0;
+bool readingDirty = false;
 tw::Dropbox dropbox(DROPBOX_APP_KEY, DROPBOX_REFRESH_TOKEN);
 
 const uint32_t PASS_US = 20000;               // drive pass length chosen in Step 1
@@ -136,6 +144,7 @@ bool clockFromNetwork = false;
 void openDocument(std::string path, std::string remotePath, std::string name) {
     doc = Document();
     history.clear();
+    reading = false;
     doc.path = path;
     doc.remotePath = remotePath;
     doc.name = name;
@@ -493,6 +502,7 @@ void finishSync() {
     if (r.textChanged) {
         if (onlyAdded) {
             history.clear(); // the text changed underneath: old steps no longer apply
+            reading = false;
             doc.text = j.text + typedSince;
             doc.sync = j.state;
             doc.unsaved = true;
@@ -686,6 +696,59 @@ void handleOpenKey(const tw::KeyEvent &e) {
     openDirty = true;
 }
 
+void stopReading() {
+    if (!reading)
+        return;
+    reading = false;
+    forceFull = true; // back to the writing page, cleanly
+}
+
+// ↑/↓ page through what you've written; Esc or Backspace return to the end;
+// typing returns to the end and types there. Returns true if the key was used.
+bool handleReadingKey(const tw::KeyEvent &e) {
+    if (!reading) {
+        if (e.type != tw::KeyEvent::Up)
+            return false;
+        readingPages = page.readingPages(doc.text);
+        if (readingPages.starts.empty()) {
+            notice = "This is the first page.";
+            dirty = true;
+            return true;
+        }
+        reading = true;
+        readingPage = readingPages.starts.size() - 1;
+        readingDirty = true;
+        return true;
+    }
+    switch (e.type) {
+    case tw::KeyEvent::Up:
+        if (readingPage > 0) {
+            readingPage--;
+            readingDirty = true;
+        }
+        return true;
+    case tw::KeyEvent::Down:
+        if (readingPage + 1 < readingPages.starts.size()) {
+            readingPage++;
+            readingDirty = true;
+        } else {
+            stopReading();
+        }
+        return true;
+    case tw::KeyEvent::Left:
+    case tw::KeyEvent::Right:
+        return true;
+    case tw::KeyEvent::Escape:
+    case tw::KeyEvent::Backspace:
+    case tw::KeyEvent::BackspaceWord:
+        stopReading();
+        return true;
+    default:
+        stopReading(); // typing and shortcuts carry on at the end
+        return false;
+    }
+}
+
 void handleKey(const tw::KeyEvent &e, uint32_t now) {
     lastKeyAt = now;
     if (screen == Screen::Open) {
@@ -697,6 +760,8 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
         notice.clear();
         markChanged(now);
     }
+    if (handleReadingKey(e))
+        return;
     switch (e.type) {
     case tw::KeyEvent::Text:
         doc.text += e.text;
@@ -1092,6 +1157,7 @@ void goToSleep(uint32_t wakeAfterSeconds) {
     }
     resumeAfterSleep = true;
     resumeOnList = screen == Screen::Open;
+    reading = false; // sleep shows (and wakes to) the page you're writing
     // A full refresh: the resting image should be clean, with no ghosting.
     if (screen == Screen::Open)
         drawOpenScreen(ASLEEP);
@@ -1277,6 +1343,23 @@ void loop() {
         if (panelOn && now - lastUpdateAt > POWER_OFF_AFTER_MS) {
             display.einkOff();
             panelOn = false;
+        }
+        return;
+    }
+
+    if (reading) {
+        if (readingDirty) {
+            readingDirty = false;
+            char left[64];
+            snprintf(left, sizeof(left), "Page %u of %u · Esc to return", (unsigned)readingPage + 1,
+                     (unsigned)readingPages.starts.size() + 1);
+            uint32_t t0 = millis();
+            page.renderReading(doc.text, readingPages, readingPage, left, nullptr);
+            display.display();
+            Serial.printf("reading: %s, line %u, %lu ms\n", left, (unsigned)readingPages.starts[readingPage],
+                          (unsigned long)(millis() - t0));
+            panelOn = false;
+            lastUpdateAt = millis();
         }
         return;
     }

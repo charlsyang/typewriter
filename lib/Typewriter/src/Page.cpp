@@ -96,6 +96,61 @@ int32_t Page::height(const std::vector<Line> &lines) const {
     return h;
 }
 
+size_t Page::pageEnd(const std::vector<Line> &lines, size_t start) const {
+    const int32_t room = layout_.textBottom - layout_.marginTop;
+    int32_t used = 0;
+    size_t k = start;
+    while (k < lines.size() && used + lineHeight(lines[k]) <= room)
+        used += lineHeight(lines[k++]);
+    return k > start ? k : start + 1;
+}
+
+Page::Reading Page::readingPages(const std::string &text) const {
+    Reading r;
+    r.lines = linesFrom(text, 0);
+    // The writing page starts at the line beginning at top_.
+    size_t writingStart = r.lines.size();
+    for (size_t k = 0; k < r.lines.size(); k++) {
+        if (r.lines[k].start >= top_) {
+            writingStart = k;
+            break;
+        }
+    }
+    size_t start = 0;
+    while (start < writingStart) {
+        r.starts.push_back(start);
+        size_t end = pageEnd(r.lines, start);
+        size_t next = end > layout_.carryLines ? end - layout_.carryLines : end;
+        start = next > start ? next : end;
+    }
+    return r;
+}
+
+void Page::renderReading(const std::string &text, const Reading &reading, size_t page, const char *footerLeft,
+                         const char *footerRight) {
+    shownValid_ = false; // the writing page has to be redrawn in full afterwards
+    display_.clearDisplay();
+    size_t first = reading.starts[page];
+    // Skip blank lines at the top of the screen.
+    while (first + 1 < reading.lines.size() && reading.lines[first].start == reading.lines[first].end)
+        first++;
+    size_t end = pageEnd(reading.lines, first);
+    int32_t y = layout_.marginTop;
+    for (size_t k = first; k < end; k++) {
+        drawText(display_, body_, layout_.marginX, y + bodyAscent_, text.c_str(), reading.lines[k].start,
+                 reading.lines[k].end);
+        y += lineHeight(reading.lines[k]);
+    }
+    const int32_t baseline = layout_.footerTop + smallAscent_;
+    if (footerLeft && *footerLeft)
+        drawText(display_, small_, layout_.marginX, baseline, footerLeft, 0, strlen(footerLeft));
+    if (footerRight && *footerRight) {
+        size_t len = strlen(footerRight);
+        int32_t w = measure(small_, footerRight, 0, len);
+        drawText(display_, small_, display_.width() - layout_.marginX - w, baseline, footerRight, 0, len);
+    }
+}
+
 void Page::showEnd(const std::string &text) {
     std::vector<Line> tail = visibleLines(text);
     top_ = tail.empty() ? 0 : tail.front().start;
