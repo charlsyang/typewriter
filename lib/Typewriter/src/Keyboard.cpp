@@ -75,7 +75,7 @@ void setState(Keyboard::State s) {
 
 bool repeats(uint8_t usage) {
     return (usage >= KEY_A && usage <= 0x38 && usage != KEY_ENTER && usage != KEY_ESC && usage != KEY_TAB) ||
-           usage == KEY_BACKSPACE;
+           usage == KEY_BACKSPACE || (usage >= 0x4F && usage <= 0x52); // arrows
 }
 
 // Turns one key press into an event; returns false for keys that do nothing.
@@ -96,6 +96,11 @@ bool translate(uint8_t usage, uint8_t mods, bool caps, KeyEvent &e) {
     }
     if (usage == KEY_TAB) {
         e.type = KeyEvent::Tab;
+        return true;
+    }
+    if (usage >= 0x4F && usage <= 0x52 && !(ctrl || gui)) { // Right, Left, Down, Up
+        static const KeyEvent::Type ARROWS[] = {KeyEvent::Right, KeyEvent::Left, KeyEvent::Down, KeyEvent::Up};
+        e.type = ARROWS[usage - 0x4F];
         return true;
     }
     if (usage == KEY_ESC) {

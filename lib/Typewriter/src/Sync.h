@@ -32,6 +32,7 @@ struct SyncResult {
         Downloaded, // the Inkplate now has Dropbox's text (no local changes)
         Merged,     // both changed; the Inkplate's new text was added to the end
         Conflict,   // both changed; the Inkplate's version was saved as a copy
+        Deleted,    // deleted in Dropbox and unchanged here: text cleared too
         Failed,
     } outcome;
     std::string message; // for Failed and Conflict
@@ -39,7 +40,7 @@ struct SyncResult {
 };
 
 // Syncs text with remotePath and updates state. On Downloaded, Merged and
-// Conflict, text is replaced with the new shared version.
+// Conflict, text is replaced with the new shared version; on Deleted it's emptied.
 SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state);
 
 } // namespace tw

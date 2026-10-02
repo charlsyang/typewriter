@@ -8,6 +8,9 @@
 //
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
+// Cmd+O lists the essays in /Site/blog to continue one; Cmd+D returns to today's
+// note. Essays sync the same way.
+//
 // Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save and sync,
 // Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
@@ -25,7 +28,9 @@
 #include <Storage.h>
 #include <Sync.h>
 #include <Text.h>
+#include <Preferences.h>
 #include <WiFi.h>
+#include <algorithm>
 #include <esp_sntp.h>
 #include <fonts/Duo24.h>
 #include <fonts/Duo40.h>
@@ -45,6 +50,7 @@ const uint32_t SYNC_AFTER_IDLE_MS = 60000;    // sync once typing pauses this lo
 const uint32_t SYNC_RETRY_MS = 120000;        // wait this long after a failed sync
 const int SYNC_FAILURES_BEFORE_NOTICE = 3;
 const char *DAILY_NOTES = "/OS/Daily Notes/"; // in Dropbox
+const char *ESSAYS = "/Site/blog";            // in Dropbox
 const uint32_t BATTERY_CHECK_EVERY_MS = 60000;
 const int LOW_BATTERY_PERCENT = 15;
 
@@ -81,7 +87,8 @@ bool clockFromNetwork = false;
 
 // ---- Document ----
 
-void openDocument(const std::string &path, const std::string &remotePath, const std::string &name) {
+// Takes copies: callers may pass the current document's own fields.
+void openDocument(std::string path, std::string remotePath, std::string name) {
     doc = Document();
     doc.path = path;
     doc.remotePath = remotePath;
@@ -207,12 +214,25 @@ void startBacklogSync(const std::string &localPath, const std::string &remotePat
     xTaskNotifyGive(syncTask);
 }
 
-// Looks for another daily note in flash with changes Dropbox doesn't have yet.
+bool endsWith(const std::string &s, const char *suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+// Looks for another note or essay in flash with changes Dropbox doesn't have yet.
 bool findBacklog(std::string &localPath, std::string &remotePath) {
-    for (const std::string &name : tw::storage::list("/daily")) {
-        if (name.size() < 4 || name.compare(name.size() - 3, 3, ".md") != 0 || name == "undated.md")
+    struct Folder {
+        const char *local;
+        std::string remote;
+    };
+    const Folder folders[] = {{"/daily/", DAILY_NOTES}, {"/blog/", std::string(ESSAYS) + "/"}};
+    for (const Folder &folder : folders) {
+    std::string dir(folder.local);
+    dir.pop_back();
+    for (const std::string &name : tw::storage::list(dir.c_str())) {
+        if (!(endsWith(name, ".md") || endsWith(name, ".mdx")) || name == "undated.md")
             continue;
-        std::string path = "/daily/" + name;
+        std::string path = folder.local + name;
         if (path == doc.path)
             continue;
         // Only notes that have synced before: older notes written before sync
@@ -221,16 +241,12 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
         if (!tw::loadSyncState(path, state) || state.rev.empty())
             continue;
         long size = tw::storage::size(path.c_str());
-        if (size >= 0 && (size_t)size != state.syncedLength) {
+        if ((size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength) {
             localPath = path;
-            remotePath = DAILY_NOTES + name;
+            remotePath = folder.remote + name;
             return true;
         }
-        if (state.keptLength < state.syncedLength) {
-            localPath = path;
-            remotePath = DAILY_NOTES + name;
-            return true;
-        }
+    }
     }
     return false;
 }
@@ -244,10 +260,25 @@ void finishSync() {
     syncRunning = false;
     SyncJob &j = syncJob;
     const tw::SyncResult &r = j.result;
-    static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "FAILED"};
+    static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "deleted",
+                                     "FAILED"};
     Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", j.why, OUTCOMES[r.outcome],
                   (unsigned long)(millis() - j.startedAt), j.state.rev.c_str(), r.message.c_str());
 
+    if (r.outcome == tw::SyncResult::Deleted) {
+        // Deleted in Dropbox: remove the Inkplate's copy too.
+        tw::storage::remove(j.localPath.c_str());
+        tw::storage::remove((j.localPath + ".sync").c_str());
+        if (j.localPath == doc.path && shortestSinceSnapshot >= j.snapshotSize && doc.text.size() == j.snapshotSize) {
+            doc.text.clear();
+            doc.sync = tw::SyncState();
+            doc.unsaved = false;
+            doc.checkedRemote = true;
+            page.reset();
+            forceFull = true;
+        }
+        return;
+    }
     if (j.localPath != doc.path) {
         if (r.outcome != tw::SyncResult::Failed) {
             if (r.textChanged)
@@ -318,8 +349,167 @@ void markChanged(uint32_t now) {
     dirty = true;
 }
 
+// ---- Essays ----
+//
+// Cmd+O lists the essays in /Site/blog, newest first; Return opens one at its
+// end to keep writing. The list is cached in flash for when Wi-Fi is off.
+
+enum class Screen { Writing, Essays };
+Screen screen = Screen::Writing;
+std::vector<tw::Dropbox::Entry> essays; // [0] is "Today's note"
+size_t essaySelected = 0;
+size_t essayTop = 0; // first row on screen
+std::string essaysProblem;
+bool essaysDirty = false;
+const char *ESSAY_LIST_CACHE = "/blog/.list";
+
+// "design-engineering-revisited.mdx" -> "Design engineering revisited"
+std::string essayTitle(const std::string &name) {
+    std::string t = name.substr(0, name.rfind('.'));
+    std::replace(t.begin(), t.end(), '-', ' ');
+    if (!t.empty() && t[0] >= 'a' && t[0] <= 'z')
+        t[0] -= 32;
+    return t;
+}
+
+void saveEssayCache() {
+    std::string data;
+    for (size_t i = 1; i < essays.size(); i++)
+        data += essays[i].name + "\t" + std::to_string(essays[i].modified) + "\n";
+    tw::storage::write(ESSAY_LIST_CACHE, data);
+}
+
+void loadEssayCache() {
+    std::string data;
+    if (!tw::storage::read(ESSAY_LIST_CACHE, data))
+        return;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t tab = data.find('\t', pos), nl = data.find('\n', pos);
+        if (tab == std::string::npos || nl == std::string::npos || tab > nl)
+            break;
+        tw::Dropbox::Entry e;
+        e.name = data.substr(pos, tab - pos);
+        e.modified = strtoul(data.c_str() + tab + 1, nullptr, 10);
+        essays.push_back(e);
+        pos = nl + 1;
+    }
+}
+
+// The sync task shares the Dropbox client, so let it finish first.
+void waitForSync() {
+    uint32_t start = millis();
+    while (syncRunning && !syncDone && millis() - start < 30000)
+        delay(20);
+    finishSync();
+}
+
+void drawEssays();
+
+void openEssayList() {
+    save("opening essays");
+    screen = Screen::Essays;
+    essays.clear();
+    tw::Dropbox::Entry today;
+    today.name = "";
+    essays.push_back(today);
+    essaysProblem.clear();
+    essaySelected = essayTop = 0;
+
+    std::vector<tw::Dropbox::Entry> found;
+    bool listed = false;
+    if (online()) {
+        essaysProblem = "Loading essays…";
+        drawEssays();
+        display.display();
+        waitForSync();
+        listed = dropbox.list(ESSAYS, found) == tw::Dropbox::Result::Ok;
+        if (!listed)
+            Serial.printf("essays: list failed: %s\n", dropbox.lastError().c_str());
+    }
+    if (listed) {
+        for (const tw::Dropbox::Entry &e : found) {
+            if (!e.folder && (endsWith(e.name, ".md") || endsWith(e.name, ".mdx")))
+                essays.push_back(e);
+        }
+        std::sort(essays.begin() + 1, essays.end(),
+                  [](const tw::Dropbox::Entry &a, const tw::Dropbox::Entry &b) { return a.modified > b.modified; });
+        saveEssayCache();
+        essaysProblem.clear();
+    } else {
+        loadEssayCache();
+        essaysProblem = essays.size() > 1 ? "Offline: showing the list from last time." : "Connect to Wi-Fi to load your essays.";
+    }
+    Serial.printf("essays: %u (%s)\n", (unsigned)essays.size() - 1, listed ? "from Dropbox" : "cached");
+    // Start on the essay you have open, if any.
+    for (size_t i = 1; i < essays.size(); i++) {
+        if ("/blog/" + essays[i].name == doc.path)
+            essaySelected = i;
+    }
+    essaysDirty = true;
+    forceFull = true;
+}
+
+void rememberOpenEssay(const std::string &name) {
+    Preferences prefs;
+    prefs.begin("typewriter", false);
+    prefs.putString("essay", name.c_str());
+    prefs.end();
+}
+
+void openEssay(const std::string &name) {
+    save("switching");
+    openDocument("/blog/" + name, std::string(ESSAYS) + "/" + name, name);
+    rememberOpenEssay(name);
+}
+
+void closeEssayList() {
+    screen = Screen::Writing;
+    forceFull = true;
+}
+
+void handleEssayKey(const tw::KeyEvent &e) {
+    size_t count = essays.size();
+    switch (e.type) {
+    case tw::KeyEvent::Up:
+        if (essaySelected > 0)
+            essaySelected--;
+        break;
+    case tw::KeyEvent::Down:
+        if (essaySelected + 1 < count)
+            essaySelected++;
+        break;
+    case tw::KeyEvent::Enter:
+        if (essaySelected == 0) {
+            rememberOpenEssay("");
+            if (doc.path.rfind("/daily/", 0) != 0) {
+                save("switching");
+                openToday();
+            }
+        } else {
+            openEssay(essays[essaySelected].name);
+        }
+        closeEssayList();
+        return;
+    case tw::KeyEvent::Escape:
+        closeEssayList();
+        return;
+    case tw::KeyEvent::Shortcut:
+        if (e.key == 'o')
+            closeEssayList();
+        return;
+    default:
+        return;
+    }
+    essaysDirty = true;
+}
+
 void handleKey(const tw::KeyEvent &e, uint32_t now) {
     lastKeyAt = now;
+    if (screen == Screen::Essays) {
+        handleEssayKey(e);
+        return;
+    }
     if (showStatus || !notice.empty()) {
         showStatus = false;
         notice.clear();
@@ -360,8 +550,21 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
             forceFull = true;
         } else if (e.key == 'k' && e.shift) {
             keyboard.forget();
+        } else if (e.key == 'o') {
+            openEssayList();
+        } else if (e.key == 'd') {
+            rememberOpenEssay("");
+            if (doc.path.rfind("/daily/", 0) != 0) {
+                save("switching");
+                openToday();
+            }
         }
         return;
+    case tw::KeyEvent::Up:
+    case tw::KeyEvent::Down:
+    case tw::KeyEvent::Left:
+    case tw::KeyEvent::Right:
+        return; // typewriter: the cursor stays at the end
     }
     edited(now);
     markChanged(now);
@@ -384,6 +587,49 @@ void handleSerial(uint32_t now) {
                 tw::wallclock::set(display, epoch, tz.c_str());
                 Serial.printf("clock set: %lu %s\n", (unsigned long)epoch, tz.c_str());
                 openToday();
+            }
+            continue;
+        }
+        tw::KeyEvent nav = {};
+        if (b == 0x0F || b == 0x04) { // Ctrl+O, Ctrl+D: same as Cmd+O, Cmd+D
+            nav.type = tw::KeyEvent::Shortcut;
+            nav.key = b == 0x0F ? 'o' : 'd';
+            nav.ctrl = true;
+            handleKey(nav, now);
+            continue;
+        }
+        if (b == 0x1B) { // Esc, or a terminal arrow key: ESC [ A/B/C/D
+            delay(5);
+            if (Serial.peek() == '[') {
+                Serial.read();
+                int code = Serial.read();
+                nav.type = code == 'A' ? tw::KeyEvent::Up
+                         : code == 'B' ? tw::KeyEvent::Down
+                         : code == 'C' ? tw::KeyEvent::Right
+                                       : tw::KeyEvent::Left;
+            } else {
+                nav.type = tw::KeyEvent::Escape;
+            }
+            handleKey(nav, now);
+            continue;
+        }
+        if (b == 0x12) { // Ctrl+R over USB, then "ls" or "rm <path>": manage files in flash
+            String line = Serial.readStringUntil('\n');
+            line.trim();
+            if (line == "ls") {
+                for (const char *dir : {"/daily", "/blog"}) {
+                    for (const std::string &name : tw::storage::list(dir)) {
+                        std::string path = std::string(dir) + "/" + name;
+                        Serial.printf("file: %s (%ld bytes)\n", path.c_str(), tw::storage::size(path.c_str()));
+                    }
+                }
+            } else if (line.startsWith("rm ")) {
+                std::string path = line.substring(3).c_str();
+                bool ok = tw::storage::remove(path.c_str());
+                tw::storage::remove((path + ".sync").c_str());
+                Serial.printf("rm %s: %s\n", path.c_str(), ok ? "ok" : "not found");
+                if (path == doc.path)
+                    openDocument(doc.path, doc.remotePath, doc.name); // reopen, now empty
             }
             continue;
         }
@@ -458,6 +704,8 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
         snprintf(out, size, "Not saved: couldn’t write to flash. Cmd+S to retry.");
     } else if (!notice.empty()) {
         snprintf(out, size, "%s", notice.c_str());
+    } else if (!doc.checkedRemote && doc.text.empty() && online() && !doc.remotePath.empty()) {
+        snprintf(out, size, "Downloading %s…", doc.name.c_str());
     } else if (doc.syncFailures >= SYNC_FAILURES_BEFORE_NOTICE) {
         snprintf(out, size, "Can’t sync with Dropbox (%s). Saved on the Inkplate.", doc.syncError.c_str());
     } else if (kb == tw::Keyboard::State::Searching || kb == tw::Keyboard::State::Connecting) {
@@ -521,6 +769,42 @@ void drawPairing() {
     display.setTextSize(1);
 }
 
+std::string monthDay(uint32_t epoch) {
+    if (!epoch)
+        return "";
+    time_t t = epoch;
+    tm local;
+    localtime_r(&t, &local);
+    char out[16];
+    strftime(out, sizeof(out), "%b %e", &local);
+    return out;
+}
+
+void drawEssays() {
+    const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance, listTop = top + rowH;
+    const int16_t bottom = 720 - 72;
+    const size_t rows = (bottom - listTop) / rowH;
+    if (essaySelected < essayTop)
+        essayTop = essaySelected;
+    if (essaySelected >= essayTop + rows)
+        essayTop = essaySelected - rows + 1;
+
+    display.clearDisplay();
+    const char *heading = "Open";
+    tw::drawText(display, Duo40, marginX, top + Duo40Ascent, heading, 0, strlen(heading));
+    for (size_t i = essayTop; i < essays.size() && i < essayTop + rows; i++) {
+        int32_t y = listTop + (i - essayTop) * rowH + Duo40Ascent;
+        std::string label = i == 0 ? "Today’s note" : essayTitle(essays[i].name);
+        std::string row = (i == essaySelected ? "› " : "  ") + label;
+        tw::drawText(display, Duo40, marginX, y, row.c_str(), 0, row.size());
+        std::string date = i == 0 ? todayName().substr(0, 10) : monthDay(essays[i].modified);
+        int32_t w = tw::measure(Duo24, date.c_str(), 0, date.size());
+        tw::drawText(display, Duo24, display.width() - marginX - w, y, date.c_str(), 0, date.size());
+    }
+    std::string footer = essaysProblem.empty() ? "↑↓ choose · Return open · Esc back" : essaysProblem;
+    tw::drawText(display, Duo24, marginX, 720 - 44 + Duo24Ascent, footer.c_str(), 0, footer.size());
+}
+
 void fullRefresh(const char *why) {
     uint32_t t0 = millis();
     partialsSinceClean = false;
@@ -542,7 +826,15 @@ void setup() {
     Serial.printf("storage: %u of %u KB used\n", (unsigned)(tw::storage::usedBytes() / 1024),
                   (unsigned)(tw::storage::totalBytes() / 1024));
     tw::wallclock::begin(display);
-    openToday();
+    // Reopen the essay you were writing, if any; otherwise today's note.
+    Preferences prefs;
+    prefs.begin("typewriter", true);
+    String essay = prefs.getString("essay", "");
+    prefs.end();
+    if (essay.length() && tw::storage::exists(("/blog/" + std::string(essay.c_str())).c_str()))
+        openEssay(essay.c_str());
+    else
+        openToday();
     keyboard.begin("Typewriter");
     xTaskCreatePinnedToCore(syncTaskLoop, "sync", 12288, nullptr, 1, &syncTask, 0);
     WiFi.mode(WIFI_STA);
@@ -625,6 +917,25 @@ void loop() {
     }
     if (showingPairing)
         return;
+
+    if (screen == Screen::Essays) {
+        if (forceFull || essaysDirty) {
+            bool full = forceFull;
+            drawEssays();
+            if (full)
+                display.display();
+            else
+                display.quickPartialUpdate(true, FOOTER_PASS_US);
+            forceFull = essaysDirty = false;
+            panelOn = !full;
+            lastUpdateAt = millis();
+        }
+        if (panelOn && now - lastUpdateAt > POWER_OFF_AFTER_MS) {
+            display.einkOff();
+            panelOn = false;
+        }
+        return;
+    }
 
     if (forceFull) {
         forceFull = false;

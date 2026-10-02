@@ -21,6 +21,9 @@ bool read(const char *path, std::string &out);
 // which LittleFS does atomically. Creates parent folders as needed.
 bool write(const char *path, const std::string &data);
 
+// Deletes a file. Returns false if it couldn't be removed.
+bool remove(const char *path);
+
 // Names of the files directly inside a folder (no subfolders).
 std::vector<std::string> list(const char *dir);
 

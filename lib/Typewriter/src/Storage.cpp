@@ -58,6 +58,10 @@ bool write(const char *path, const std::string &data) {
     return LittleFS.rename(tmp.c_str(), path);
 }
 
+bool remove(const char *path) {
+    return LittleFS.remove(path);
+}
+
 std::vector<std::string> list(const char *dir) {
     std::vector<std::string> names;
     File d = LittleFS.open(dir);

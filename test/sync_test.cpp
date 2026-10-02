@@ -146,6 +146,28 @@ int main() {
         EXPECT(loadSyncState("/daily/2026-10-01.md", loaded));
         EXPECT(loaded.rev == s.rev && loaded.syncedLength == 6 && loaded.keptLength == 6);
     }
+    {
+        puts("deleted in Dropbox with nothing new typed: deleted here too");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Old note.";
+        syncFile(db, PATH, text, s);
+        db.files.erase(PATH);
+        SyncResult r = syncFile(db, PATH, text, s);
+        EXPECT(r.outcome == SyncResult::Deleted && text.empty() && s.rev.empty());
+        EXPECT(!db.files.count(PATH));
+    }
+    {
+        puts("deleted in Dropbox but typed since: uploaded again");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Old note.";
+        syncFile(db, PATH, text, s);
+        db.files.erase(PATH);
+        type(text, s, " New words.");
+        SyncResult r = syncFile(db, PATH, text, s);
+        EXPECT(r.outcome == SyncResult::Uploaded && db.files[PATH] == "Old note. New words.");
+    }
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;
 }

@@ -105,6 +105,15 @@ SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string
     if (r == Dropbox::Result::NotFound) {
         if (text.empty())
             return result;
+        // It was synced and you haven't typed since: it was deleted elsewhere
+        // (e.g. on the laptop), so don't bring it back.
+        if (!state.rev.empty() && !localChanges) {
+            text.clear();
+            state = SyncState();
+            result.outcome = SyncResult::Deleted;
+            result.textChanged = true;
+            return result;
+        }
         std::string rev;
         if (dropbox.upload(remotePath, text, "", rev) != Dropbox::Result::Ok)
             return fail("uploading");

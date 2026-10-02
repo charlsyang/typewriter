@@ -18,6 +18,10 @@ struct KeyEvent {
         Enter,
         Tab,
         Escape,
+        Up,
+        Down,
+        Left,
+        Right,
         Shortcut, // Ctrl or Cmd with a letter: key holds the lowercase letter
     };
     Type type;
