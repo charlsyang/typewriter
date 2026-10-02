@@ -954,7 +954,7 @@ void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std
 // The daily note, then a "Drafts" section. Drafts scroll; the daily note stays put.
 void drawOpenScreen() {
     const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
-    const int16_t labelY = top + rowH + 24;         // section label, after a gap
+    const int16_t labelY = top + rowH + 48;         // section label, after a gap
     const int16_t listTop = labelY + 60;             // first draft row
     const int16_t bottom = 720 - 72;
     const size_t rows = (bottom - listTop) / rowH;
