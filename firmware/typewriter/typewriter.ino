@@ -6,9 +6,9 @@
 // minute without typing, and on Cmd+S. The screen shows only your text; a footer
 // line appears when something needs attention, or on Cmd+I.
 //
-// After 10 minutes without typing it saves, syncs and deep-sleeps, leaving the
-// page on screen; the WAKE button resumes where you were. Switching on starts at
-// the list.
+// After 10 minutes without typing, or a press of the WAKE button, it saves,
+// syncs and deep-sleeps, leaving the page on screen; WAKE resumes where you
+// were. Switching on starts at the list.
 //
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
@@ -1045,6 +1045,31 @@ void goToSleep(uint32_t wakeAfterSeconds) {
     esp_deep_sleep_start(); // does not return
 }
 
+// The WAKE button also puts it to sleep. It must be let go once first (it is
+// usually still held from waking), and again before sleeping, or the press
+// would wake it straight back up.
+void checkWakeButton(uint32_t now) {
+    static bool releasedSinceStart = false;
+    static uint32_t pressedAt = 0;
+    bool pressed = digitalRead(WAKE_BUTTON) == LOW;
+    if (!pressed) {
+        releasedSinceStart = true;
+        pressedAt = 0;
+        return;
+    }
+    if (!releasedSinceStart)
+        return;
+    if (!pressedAt)
+        pressedAt = now;
+    if (now - pressedAt < 50) // debounce
+        return;
+    Serial.println("sleep: WAKE button pressed");
+    uint32_t waitStart = millis();
+    while (digitalRead(WAKE_BUTTON) == LOW && millis() - waitStart < 5000)
+        delay(10);
+    goToSleep();
+}
+
 // ---- Main ----
 
 void setup() {
@@ -1055,6 +1080,7 @@ void setup() {
         Serial.println("storage: mount FAILED");
     Serial.printf("storage: %u of %u KB used\n", (unsigned)(tw::storage::usedBytes() / 1024),
                   (unsigned)(tw::storage::totalBytes() / 1024));
+    pinMode(WAKE_BUTTON, INPUT); // GPIO 36 is input-only; the board pulls it up
     tw::wallclock::begin(display);
     tw::storage::remove("/blog/.list"); // replaced by DRAFTS_CACHE
     drafts = draftsFrom(loadDraftsCache());
@@ -1123,6 +1149,7 @@ void loop() {
 
     if (now - lastKeyAt > SLEEP_AFTER_IDLE_MS && !showingPairing)
         goToSleep();
+    checkWakeButton(now);
 
     bool idle = now - lastKeyAt > SYNC_AFTER_IDLE_MS;
     // A new day: once you pause, move on to the new daily note.
