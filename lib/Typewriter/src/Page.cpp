@@ -99,6 +99,23 @@ int32_t Page::height(const std::vector<Line> &lines) const {
 void Page::showEnd(const std::string &text) {
     std::vector<Line> tail = visibleLines(text);
     top_ = tail.empty() ? 0 : tail.front().start;
+    shownValid_ = false;
+}
+
+// Clears rows [y0, y1) to white. In 1-bit mode with no rotation each screen row
+// is one row of the frame buffer, so this is a single memset; fillRect would set
+// the pixels one at a time (hundreds of milliseconds for a large band).
+void Page::clearRows(int32_t y0, int32_t y1) {
+    y0 = max<int32_t>(y0, 0);
+    y1 = min<int32_t>(y1, display_.height());
+    if (y1 <= y0)
+        return;
+    if (display_.getRotation() == 0 && display_.getDisplayMode() == INKPLATE_1BIT) {
+        const size_t rowBytes = E_INK_WIDTH / 8;
+        memset(display_._partial + rowBytes * y0, 0, rowBytes * (y1 - y0));
+    } else {
+        display_.fillRect(0, y0, display_.width(), y1 - y0, WHITE);
+    }
 }
 
 bool Page::render(const std::string &text, const char *footerLeft, const char *footerRight) {
@@ -126,7 +143,6 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
         turned = true;
     }
 
-    display_.clearDisplay();
     const char *s = text.c_str();
 
     // Skip blank lines at the top of the screen.
@@ -134,10 +150,38 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
     while (first + 1 < lines.size() && lines[first].start == lines[first].end)
         first++;
 
+    // Redraw from the first line that differs from what's on screen (always
+    // including the last line, where the cursor is), or everything if the page
+    // moved or something else was drawn.
+    std::string footer = std::string(footerLeft ? footerLeft : "") + "\n" + (footerRight ? footerRight : "");
+    size_t from = first;
+    bool patch = shownValid_ && !turned && top_ == shownTop_;
+    if (patch) {
+        from = lines.size() - 1;
+        for (size_t k = first; k + 1 < lines.size(); k++) {
+            const Line &now = lines[k];
+            bool same = k < shownLines_.size() && shownLines_[k].start == now.start && shownLines_[k].end == now.end &&
+                        now.end <= shownText_.size() &&
+                        shownText_.compare(now.start, now.end - now.start, text, now.start, now.end - now.start) == 0;
+            if (!same) {
+                from = k;
+                break;
+            }
+        }
+    }
+
     int32_t y = layout_.marginTop;
+    for (size_t k = first; k < from; k++)
+        y += lineHeight(lines[k]);
+    if (patch) {
+        clearRows(y, layout_.textBottom);
+    } else {
+        display_.clearDisplay();
+    }
+
     int32_t cursorX = layout_.marginX;
     int32_t cursorY = y;
-    for (size_t k = first; k < lines.size(); k++) {
+    for (size_t k = from; k < lines.size(); k++) {
         cursorX = drawText(display_, body_, layout_.marginX, y + bodyAscent_, s, lines[k].start, lines[k].end);
         cursorY = y;
         y += lineHeight(lines[k]);
@@ -147,14 +191,24 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
     const int16_t size = body_.yAdvance * 2 / 3; // font size in px (line spacing is 1.5)
     display_.fillRect(cursorX + 4, cursorY + size * 15 / 100, 3, size * 90 / 100, BLACK);
 
-    const int32_t baseline = layout_.footerTop + smallAscent_;
-    if (footerLeft && *footerLeft)
-        drawText(display_, small_, layout_.marginX, baseline, footerLeft, 0, strlen(footerLeft));
-    if (footerRight && *footerRight) {
-        size_t len = strlen(footerRight);
-        int32_t w = measure(small_, footerRight, 0, len);
-        drawText(display_, small_, display_.width() - layout_.marginX - w, baseline, footerRight, 0, len);
+    if (!patch || footer != shownFooter_) {
+        if (patch)
+            clearRows(layout_.textBottom, display_.height());
+        const int32_t baseline = layout_.footerTop + smallAscent_;
+        if (footerLeft && *footerLeft)
+            drawText(display_, small_, layout_.marginX, baseline, footerLeft, 0, strlen(footerLeft));
+        if (footerRight && *footerRight) {
+            size_t len = strlen(footerRight);
+            int32_t w = measure(small_, footerRight, 0, len);
+            drawText(display_, small_, display_.width() - layout_.marginX - w, baseline, footerRight, 0, len);
+        }
     }
+
+    shownValid_ = true;
+    shownTop_ = top_;
+    shownLines_ = lines;
+    shownText_ = text;
+    shownFooter_ = footer;
     return turned;
 }
 

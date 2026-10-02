@@ -109,6 +109,7 @@ struct SyncJob {
 RTC_DATA_ATTR bool resumeAfterSleep = false;
 RTC_DATA_ATTR bool resumeOnList = false;
 void goToSleep(uint32_t wakeAfterSeconds = 0);
+void checkBattery(uint32_t now, bool force = false);
 
 Document doc;
 uint32_t lastKeyAt = 0;
@@ -660,7 +661,9 @@ void handleOpenKey(const tw::KeyEvent &e) {
         closeOpenScreen();
         return;
     case tw::KeyEvent::Shortcut:
-        if (e.key == 'o')
+        if (e.key == 'd')
+            openTodayFromList();
+        if (e.key == 'o' || e.key == 'd')
             closeOpenScreen();
         return;
     default:
@@ -710,6 +713,7 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
             markChanged(now);
         } else if (e.key == 'i') {
             showStatus = true;
+            checkBattery(now, true); // a fresh reading, not one from up to a minute ago
             markChanged(now);
         } else if (e.key == 'l') {
             forceFull = true;
@@ -774,10 +778,13 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        if (b == 0x12) { // Ctrl+R over USB, then "ls", "rm <path>" or "sleep [seconds]"
+        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "rm <path>" or "sleep [seconds]"
             String line = Serial.readStringUntil('\n');
             line.trim();
-            if (line == "ls") {
+            if (line == "status") {
+                Serial.printf("status: screen %s, document %s (%u bytes)\n", screen == Screen::Open ? "list" : "writing",
+                              doc.path.c_str(), (unsigned)doc.text.size());
+            } else if (line == "ls") {
                 for (const char *dir : {"/daily", "/blog"}) {
                     for (const std::string &name : tw::storage::list(dir)) {
                         std::string path = std::string(dir) + "/" + name;
@@ -825,23 +832,53 @@ void handleSerial(uint32_t now) {
 
 // ---- Screen ----
 
-void checkBattery(uint32_t now) {
-    if (lastBatteryCheckAt && now - lastBatteryCheckAt < BATTERY_CHECK_EVERY_MS)
+// Typical resting voltage of a Li-ion cell at each charge level: the curve is
+// flat in the middle and steep near the ends, so a straight line misleads.
+const float CELL_CURVE[][2] = {{3.40, 0},  {3.61, 5},  {3.69, 10}, {3.73, 20}, {3.77, 30}, {3.79, 40},
+                               {3.82, 50}, {3.86, 60}, {3.91, 70}, {3.97, 80}, {4.05, 90}, {4.15, 100}};
+
+int percentFromVoltage(float v) {
+    const int n = sizeof(CELL_CURVE) / sizeof(CELL_CURVE[0]);
+    if (v <= CELL_CURVE[0][0])
+        return 0;
+    for (int i = 1; i < n; i++) {
+        if (v <= CELL_CURVE[i][0]) {
+            float t = (v - CELL_CURVE[i - 1][0]) / (CELL_CURVE[i][0] - CELL_CURVE[i - 1][0]);
+            return CELL_CURVE[i - 1][1] + t * (CELL_CURVE[i][1] - CELL_CURVE[i - 1][1]);
+        }
+    }
+    return 100;
+}
+
+// Measures the battery: the average of several readings, smoothed over time
+// (radio bursts and the charger's surface charge make single readings jumpy),
+// shown in steps of 5%. force: measure now (Cmd+I) rather than once a minute.
+void checkBattery(uint32_t now, bool force) {
+    static float smoothed = 0;
+    if (!force && lastBatteryCheckAt && now - lastBatteryCheckAt < BATTERY_CHECK_EVERY_MS)
         return;
     lastBatteryCheckAt = now;
-    double v = display.readBattery();
-    // A Li-ion cell reads about 3.4 V empty to 4.15 V full. On USB with no
-    // battery the charger's own 4.2 V shows through, so treat that as no battery;
-    // a real cell only reaches it while fully charged on USB.
+    float v = 0;
+    for (int i = 0; i < 8; i++)
+        v += display.readBattery();
+    v /= 8;
     int previous = batteryPercent;
-    if (v < 3.0 || v >= 4.18)
+    // On USB with no battery, or a full one, the charger's 4.2 V shows through.
+    if (v < 3.0 || v >= 4.18) {
         batteryPercent = -1;
-    else
-        batteryPercent = constrain((int)((v - 3.4) / (4.15 - 3.4) * 100), 0, 100);
-    Serial.printf("battery: %.2f V (%d%%)\n", v, batteryPercent);
+        smoothed = 0;
+    } else {
+        smoothed = smoothed == 0 || previous < 0 ? v : smoothed * 0.7f + v * 0.3f;
+        int percent = (percentFromVoltage(smoothed) + 2) / 5 * 5;
+        // On battery the charge only goes down; ignore small upward wobbles.
+        if (previous >= 0 && percent > previous && percent - previous < 10)
+            percent = previous;
+        batteryPercent = percent;
+    }
+    Serial.printf("battery: %.3f V, smoothed %.3f V (%d%%)\n", v, smoothed, batteryPercent);
     bool wasLow = previous >= 0 && previous <= LOW_BATTERY_PERCENT;
     bool isLow = batteryPercent >= 0 && batteryPercent <= LOW_BATTERY_PERCENT;
-    if (wasLow != isLow)
+    if (wasLow != isLow || (showStatus && previous != batteryPercent))
         markChanged(now);
 }
 
@@ -921,6 +958,7 @@ void drawPairing() {
         if (i < 5)
             spaced[j++] = ' ';
     }
+    page.invalidate();
     display.clearDisplay();
     drawCentered(180, "Type this code on the keyboard,");
     drawCentered(240, "then press Return:");
@@ -980,6 +1018,7 @@ void drawOpenScreen(const char *hintOverride = nullptr) {
             firstVisible = i - rows + 1;
     }
 
+    page.invalidate(); // the writing page has to be redrawn in full next time
     display.clearDisplay();
     std::string today = todayName().substr(0, 10); // YYYY-MM-DD
     std::string todayDate = today.size() == 10 ? today.substr(5, 2) + "-" + today.substr(8, 2) + "-" + today.substr(0, 4) : "";
@@ -1256,4 +1295,8 @@ void loop() {
 
     if (partialsSinceClean && now - lastKeyAt > CLEAN_AFTER_IDLE_MS && now - lastUpdateAt > CLEAN_AFTER_IDLE_MS)
         fullRefresh("idle");
+
+    // Nothing to do this time round: rest a moment instead of spinning the CPU
+    // flat out (it adds at most 5 ms before a key shows).
+    delay(5);
 }

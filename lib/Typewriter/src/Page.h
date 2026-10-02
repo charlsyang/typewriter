@@ -33,7 +33,13 @@ class Page {
     bool render(const std::string &text, const char *footerLeft, const char *footerRight = nullptr);
 
     // Starts the next render at the top of the text (for a new document).
-    void reset() { top_ = 0; }
+    void reset() {
+        top_ = 0;
+        shownValid_ = false;
+    }
+
+    // The next render redraws everything: call after drawing anything else.
+    void invalidate() { shownValid_ = false; }
 
     // Starts the next render on a page that ends with the end of the text (for
     // opening an existing document).
@@ -47,6 +53,7 @@ class Page {
     std::vector<Line> linesFrom(const std::string &text, size_t top) const;
     int32_t height(const std::vector<Line> &lines) const;
     int16_t lineHeight(const Line &line) const;
+    void clearRows(int32_t y0, int32_t y1);
 
     Inkplate &display_;
     const GFXfont &body_;
@@ -55,6 +62,14 @@ class Page {
     int16_t smallAscent_;
     Layout layout_;
     size_t top_ = 0; // byte offset of the first line on the page
+
+    // What the frame buffer holds from the last render, so the next one only
+    // redraws what changed (usually the line being typed).
+    bool shownValid_ = false;
+    size_t shownTop_ = 0;
+    std::vector<Line> shownLines_;
+    std::string shownText_;
+    std::string shownFooter_;
 };
 
 } // namespace tw
