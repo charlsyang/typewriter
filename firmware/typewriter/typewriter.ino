@@ -8,8 +8,9 @@
 //
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
-// Cmd+O lists the essays in /Site/blog to continue one; Cmd+D returns to today's
-// note. Essays sync the same way.
+// Cmd+O lists today's note and your drafts (essays in /Site/blog without
+// isPublished: true), all kept on the Inkplate; Cmd+D returns to today's note.
+// Drafts sync the same way. Daily notes that are blank never go to Dropbox.
 //
 // Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save and sync,
 // Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
@@ -67,6 +68,33 @@ struct Document {
     int syncFailures = 0;       // in a row
     uint32_t lastSyncAttemptAt = 0;
     std::string syncError;
+};
+
+// Drafts: essays in /Site/blog with no front matter, or isPublished: false.
+// Every draft is kept on the Inkplate; published essays aren't.
+struct DraftInfo {
+    std::string name; // e.g. design-engineering-revisited.mdx
+    std::string rev;
+    uint32_t modified = 0;
+    bool draft = false;
+};
+
+enum class JobKind { File, Drafts };
+struct SyncJob {
+    JobKind kind;
+    std::string localPath, remotePath;
+    std::string text;    // snapshot, replaced by the shared version if it changed
+    size_t snapshotSize; // bytes in the snapshot
+    tw::SyncState state;
+    bool blankMeansAbsent; // daily notes: never upload a blank note
+    tw::SyncResult result;
+    // Drafts job
+    std::string openPath; // the note on screen: left to its own sync
+    std::vector<DraftInfo> all;
+    bool listed;
+    int downloaded, removed;
+    const char *why;
+    uint32_t startedAt;
 };
 
 Document doc;
@@ -153,35 +181,175 @@ bool online() {
     return WiFi.status() == WL_CONNECTED;
 }
 
-// Sync runs in its own task, so typing never waits on the network. It works on
-// a snapshot of the note; text typed meanwhile stays local and goes up next time.
-struct SyncJob {
-    std::string localPath, remotePath;
-    std::string text;    // snapshot, replaced by the shared version if it changed
-    size_t snapshotSize; // bytes in the snapshot
-    tw::SyncState state;
-    tw::SyncResult result;
-    const char *why;
-    uint32_t startedAt;
-};
+const char *DRAFTS_CACHE = "/blog/.drafts"; // name, rev, draft (0/1), modified per line
+
+std::vector<DraftInfo> loadDraftsCache() {
+    std::vector<DraftInfo> all;
+    std::string data;
+    if (!tw::storage::read(DRAFTS_CACHE, data))
+        return all;
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t nl = data.find('\n', pos);
+        if (nl == std::string::npos)
+            break;
+        std::string line = data.substr(pos, nl - pos);
+        pos = nl + 1;
+        size_t a = line.find('\t'), b = line.find('\t', a + 1), c = line.find('\t', b + 1);
+        if (c == std::string::npos)
+            continue;
+        DraftInfo d;
+        d.name = line.substr(0, a);
+        d.rev = line.substr(a + 1, b - a - 1);
+        d.draft = line[b + 1] == '1';
+        d.modified = strtoul(line.c_str() + c + 1, nullptr, 10);
+        all.push_back(d);
+    }
+    return all;
+}
+
+void saveDraftsCache(const std::vector<DraftInfo> &all) {
+    std::string data;
+    for (const DraftInfo &d : all)
+        data += d.name + "\t" + d.rev + "\t" + (d.draft ? "1" : "0") + "\t" + std::to_string(d.modified) + "\n";
+    tw::storage::write(DRAFTS_CACHE, data);
+}
+
+// Drafts only, newest first.
+std::vector<DraftInfo> draftsFrom(const std::vector<DraftInfo> &all) {
+    std::vector<DraftInfo> drafts;
+    for (const DraftInfo &d : all) {
+        if (d.draft)
+            drafts.push_back(d);
+    }
+    std::sort(drafts.begin(), drafts.end(), [](const DraftInfo &a, const DraftInfo &b) { return a.modified > b.modified; });
+    return drafts;
+}
+
+// Published essays start with front matter ("---" lines) that sets
+// isPublished: true. No front matter, or anything else, means a draft.
+bool isDraftText(const std::string &start) {
+    if (start.rfind("---", 0) != 0)
+        return true;
+    size_t end = start.find("\n---", 3);
+    std::string front = start.substr(0, end == std::string::npos ? start.size() : end);
+    size_t key = front.find("isPublished:");
+    if (key == std::string::npos)
+        return true;
+    size_t value = front.find_first_not_of(" \t'\"", key + strlen("isPublished:"));
+    return value == std::string::npos || front.compare(value, 4, "true") != 0;
+}
+
+bool endsWith(const std::string &s, const char *suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+bool isMarkdown(const std::string &name) {
+    return endsWith(name, ".md") || endsWith(name, ".mdx");
+}
+
+// Background work runs in its own task, so typing never waits on the network.
+// A file sync works on a snapshot of the note; text typed meanwhile stays local
+// and goes up next time.
 SyncJob syncJob;
 volatile bool syncRunning = false;
 volatile bool syncDone = false;
 size_t shortestSinceSnapshot = 0; // Backspace below the snapshot while syncing
 TaskHandle_t syncTask;
 
+// Brings one draft's copy on the Inkplate up to date with Dropbox's, unless it
+// has changes of its own (the regular sync merges those).
+bool fetchDraft(const DraftInfo &d) {
+    std::string local = "/blog/" + d.name;
+    tw::SyncState state;
+    std::string text;
+    bool exists = tw::storage::read(local.c_str(), text);
+    tw::loadSyncState(local, state);
+    if (exists && (state.rev == d.rev || tw::hasLocalChanges(text, state)))
+        return false;
+    std::string rev;
+    if (dropbox.download(std::string(ESSAYS) + "/" + d.name, text, rev) != tw::Dropbox::Result::Ok)
+        return false;
+    state.rev = rev;
+    state.syncedLength = state.keptLength = text.size();
+    return tw::storage::write(local.c_str(), text) && tw::saveSyncState(local, state);
+}
+
+// Lists /Site/blog, sorts drafts from published essays (reading only the start
+// of files that changed since last time), keeps every draft on the Inkplate,
+// and removes copies of essays that are now published or gone.
+void refreshDrafts(SyncJob &j) {
+    j.downloaded = j.removed = 0;
+    std::vector<tw::Dropbox::Entry> entries;
+    j.listed = dropbox.list(ESSAYS, entries) == tw::Dropbox::Result::Ok;
+    if (!j.listed)
+        return;
+    std::vector<DraftInfo> cached = loadDraftsCache();
+    j.all.clear();
+    for (const tw::Dropbox::Entry &e : entries) {
+        if (e.folder || !isMarkdown(e.name))
+            continue;
+        DraftInfo d;
+        d.name = e.name;
+        d.rev = e.rev;
+        d.modified = e.modified;
+        auto known = std::find_if(cached.begin(), cached.end(), [&](const DraftInfo &c) { return c.name == e.name; });
+        if (known != cached.end() && known->rev == e.rev) {
+            d.draft = known->draft;
+        } else {
+            std::string start;
+            if (dropbox.downloadStart(std::string(ESSAYS) + "/" + e.name, 1024, start) != tw::Dropbox::Result::Ok)
+                continue; // try again next refresh
+            d.draft = isDraftText(start);
+        }
+        j.all.push_back(d);
+        if (d.draft && "/blog/" + d.name != j.openPath && fetchDraft(d))
+            j.downloaded++;
+    }
+    saveDraftsCache(j.all);
+
+    // Copies of essays that are no longer drafts, and have nothing unsynced.
+    for (const std::string &name : tw::storage::list("/blog")) {
+        if (!isMarkdown(name) || "/blog/" + name == j.openPath)
+            continue;
+        bool isDraft = std::any_of(j.all.begin(), j.all.end(), [&](const DraftInfo &d) { return d.draft && d.name == name; });
+        if (isDraft)
+            continue;
+        std::string local = "/blog/" + name, text;
+        tw::SyncState state;
+        tw::storage::read(local.c_str(), text);
+        tw::loadSyncState(local, state);
+        if (tw::hasLocalChanges(text, state))
+            continue;
+        tw::storage::remove(local.c_str());
+        tw::storage::remove((local + ".sync").c_str());
+        j.removed++;
+    }
+}
+
 void syncTaskLoop(void *) {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        syncJob.result = tw::syncFile(dropbox, syncJob.remotePath, syncJob.text, syncJob.state);
+        if (syncJob.kind == JobKind::Drafts)
+            refreshDrafts(syncJob);
+        else
+            syncJob.result = tw::syncFile(dropbox, syncJob.remotePath, syncJob.text, syncJob.state,
+                                          syncJob.blankMeansAbsent);
         syncDone = true;
     }
+}
+
+bool isDailyNote(const std::string &remotePath) {
+    return remotePath.rfind(DAILY_NOTES, 0) == 0;
 }
 
 void startSync(const char *why) {
     if (syncRunning || doc.remotePath.empty() || !online())
         return;
     save(why);
+    syncJob.kind = JobKind::File;
+    syncJob.blankMeansAbsent = isDailyNote(doc.remotePath);
     syncJob.localPath = doc.path;
     syncJob.remotePath = doc.remotePath;
     syncJob.text = doc.text;
@@ -201,6 +369,8 @@ void startSync(const char *why) {
 void startBacklogSync(const std::string &localPath, const std::string &remotePath) {
     if (syncRunning || !online())
         return;
+    syncJob.kind = JobKind::File;
+    syncJob.blankMeansAbsent = isDailyNote(remotePath);
     syncJob.localPath = localPath;
     syncJob.remotePath = remotePath;
     if (!tw::storage::read(localPath.c_str(), syncJob.text))
@@ -214,11 +384,6 @@ void startBacklogSync(const std::string &localPath, const std::string &remotePat
     xTaskNotifyGive(syncTask);
 }
 
-bool endsWith(const std::string &s, const char *suffix) {
-    size_t n = strlen(suffix);
-    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
-}
-
 // Looks for another note or essay in flash with changes Dropbox doesn't have yet.
 bool findBacklog(std::string &localPath, std::string &remotePath) {
     struct Folder {
@@ -230,7 +395,7 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
     std::string dir(folder.local);
     dir.pop_back();
     for (const std::string &name : tw::storage::list(dir.c_str())) {
-        if (!(endsWith(name, ".md") || endsWith(name, ".mdx")) || name == "undated.md")
+        if (!isMarkdown(name) || name == "undated.md")
             continue;
         std::string path = folder.local + name;
         if (path == doc.path)
@@ -251,6 +416,8 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
     return false;
 }
 
+void finishDraftsRefresh();
+
 // Applies a finished sync to the note (or to the file it was for, if you've
 // moved on to another note since).
 void finishSync() {
@@ -259,6 +426,10 @@ void finishSync() {
     syncDone = false;
     syncRunning = false;
     SyncJob &j = syncJob;
+    if (j.kind == JobKind::Drafts) {
+        finishDraftsRefresh();
+        return;
+    }
     const tw::SyncResult &r = j.result;
     static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "deleted",
                                      "FAILED"};
@@ -349,19 +520,22 @@ void markChanged(uint32_t now) {
     dirty = true;
 }
 
-// ---- Essays ----
+// ---- Open: today's note and drafts ----
 //
-// Cmd+O lists the essays in /Site/blog, newest first; Return opens one at its
-// end to keep writing. The list is cached in flash for when Wi-Fi is off.
+// Cmd+O shows today's note and the drafts in /Site/blog, newest first, right
+// away from what's on the Inkplate, and checks Dropbox in the background.
+// Return opens one at its end to keep writing.
 
-enum class Screen { Writing, Essays };
+enum class Screen { Writing, Open };
 Screen screen = Screen::Writing;
-std::vector<tw::Dropbox::Entry> essays; // [0] is "Today's note"
-size_t essaySelected = 0;
-size_t essayTop = 0; // first row on screen
-std::string essaysProblem;
-bool essaysDirty = false;
-const char *ESSAY_LIST_CACHE = "/blog/.list";
+std::vector<DraftInfo> drafts; // what the Open screen lists after today's note
+size_t selected = 0;           // 0: today's note, then drafts
+size_t firstVisible = 0;       // first draft row on screen
+bool openDirty = false;
+bool draftsWanted = true;  // refresh drafts from Dropbox when free
+bool draftsChecking = false;
+uint32_t lastDraftsRefreshAt = 0;
+const uint32_t DRAFTS_REFRESH_EVERY_MS = 10 * 60 * 1000;
 
 // "design-engineering-revisited.mdx" -> "Design engineering revisited"
 std::string essayTitle(const std::string &name) {
@@ -372,82 +546,45 @@ std::string essayTitle(const std::string &name) {
     return t;
 }
 
-void saveEssayCache() {
-    std::string data;
-    for (size_t i = 1; i < essays.size(); i++)
-        data += essays[i].name + "\t" + std::to_string(essays[i].modified) + "\n";
-    tw::storage::write(ESSAY_LIST_CACHE, data);
-}
-
-void loadEssayCache() {
-    std::string data;
-    if (!tw::storage::read(ESSAY_LIST_CACHE, data))
+void startDraftsRefresh() {
+    if (syncRunning || !online())
         return;
-    size_t pos = 0;
-    while (pos < data.size()) {
-        size_t tab = data.find('\t', pos), nl = data.find('\n', pos);
-        if (tab == std::string::npos || nl == std::string::npos || tab > nl)
-            break;
-        tw::Dropbox::Entry e;
-        e.name = data.substr(pos, tab - pos);
-        e.modified = strtoul(data.c_str() + tab + 1, nullptr, 10);
-        essays.push_back(e);
-        pos = nl + 1;
-    }
+    syncJob.kind = JobKind::Drafts;
+    syncJob.openPath = doc.path;
+    syncJob.why = "drafts";
+    syncJob.startedAt = millis();
+    draftsWanted = false;
+    draftsChecking = true;
+    lastDraftsRefreshAt = millis();
+    syncDone = false;
+    syncRunning = true;
+    xTaskNotifyGive(syncTask);
 }
 
-// The sync task shares the Dropbox client, so let it finish first.
-void waitForSync() {
-    uint32_t start = millis();
-    while (syncRunning && !syncDone && millis() - start < 30000)
-        delay(20);
-    finishSync();
-}
-
-void drawEssays();
-
-void openEssayList() {
-    save("opening essays");
-    screen = Screen::Essays;
-    essays.clear();
-    tw::Dropbox::Entry today;
-    today.name = "";
-    essays.push_back(today);
-    essaysProblem.clear();
-    essaySelected = essayTop = 0;
-
-    std::vector<tw::Dropbox::Entry> found;
-    bool listed = false;
-    if (online()) {
-        essaysProblem = "Loading essays…";
-        drawEssays();
-        display.display();
-        waitForSync();
-        listed = dropbox.list(ESSAYS, found) == tw::Dropbox::Result::Ok;
-        if (!listed)
-            Serial.printf("essays: list failed: %s\n", dropbox.lastError().c_str());
+void finishDraftsRefresh() {
+    SyncJob &j = syncJob;
+    draftsChecking = false;
+    if (!j.listed) {
+        Serial.printf("drafts: couldn't list %s: %s\n", ESSAYS, dropbox.lastError().c_str());
+        return;
     }
-    if (listed) {
-        for (const tw::Dropbox::Entry &e : found) {
-            if (!e.folder && (endsWith(e.name, ".md") || endsWith(e.name, ".mdx")))
-                essays.push_back(e);
+    std::vector<DraftInfo> fresh = draftsFrom(j.all);
+    Serial.printf("drafts: %u of %u essays, %d downloaded, %d removed, %lu ms\n", (unsigned)fresh.size(),
+                  (unsigned)j.all.size(), j.downloaded, j.removed, (unsigned long)(millis() - j.startedAt));
+    bool changed = fresh.size() != drafts.size();
+    for (size_t i = 0; !changed && i < fresh.size(); i++)
+        changed = fresh[i].name != drafts[i].name || fresh[i].modified != drafts[i].modified;
+    std::string selectedName = selected > 0 && selected <= drafts.size() ? drafts[selected - 1].name : "";
+    drafts = fresh;
+    if (selected > 0) {
+        selected = 0;
+        for (size_t i = 0; i < drafts.size(); i++) {
+            if (drafts[i].name == selectedName)
+                selected = i + 1;
         }
-        std::sort(essays.begin() + 1, essays.end(),
-                  [](const tw::Dropbox::Entry &a, const tw::Dropbox::Entry &b) { return a.modified > b.modified; });
-        saveEssayCache();
-        essaysProblem.clear();
-    } else {
-        loadEssayCache();
-        essaysProblem = essays.size() > 1 ? "Offline: showing the list from last time." : "Connect to Wi-Fi to load your essays.";
     }
-    Serial.printf("essays: %u (%s)\n", (unsigned)essays.size() - 1, listed ? "from Dropbox" : "cached");
-    // Start on the essay you have open, if any.
-    for (size_t i = 1; i < essays.size(); i++) {
-        if ("/blog/" + essays[i].name == doc.path)
-            essaySelected = i;
-    }
-    essaysDirty = true;
-    forceFull = true;
+    if (screen == Screen::Open)
+        openDirty = openDirty || changed;
 }
 
 void rememberOpenEssay(const std::string &name) {
@@ -463,51 +600,66 @@ void openEssay(const std::string &name) {
     rememberOpenEssay(name);
 }
 
-void closeEssayList() {
+void openTodayFromList() {
+    rememberOpenEssay("");
+    if (doc.path.rfind("/daily/", 0) != 0) {
+        save("switching");
+        openToday();
+    }
+}
+
+void showOpenScreen() {
+    save("opening the list");
+    screen = Screen::Open;
+    selected = 0;
+    for (size_t i = 0; i < drafts.size(); i++) {
+        if ("/blog/" + drafts[i].name == doc.path)
+            selected = i + 1;
+    }
+    firstVisible = 0;
+    draftsWanted = true; // check Dropbox for new drafts in the background
+    forceFull = true;
+}
+
+void closeOpenScreen() {
     screen = Screen::Writing;
     forceFull = true;
 }
 
-void handleEssayKey(const tw::KeyEvent &e) {
-    size_t count = essays.size();
+void handleOpenKey(const tw::KeyEvent &e) {
     switch (e.type) {
     case tw::KeyEvent::Up:
-        if (essaySelected > 0)
-            essaySelected--;
+        if (selected > 0)
+            selected--;
         break;
     case tw::KeyEvent::Down:
-        if (essaySelected + 1 < count)
-            essaySelected++;
+        if (selected < drafts.size())
+            selected++;
         break;
     case tw::KeyEvent::Enter:
-        if (essaySelected == 0) {
-            rememberOpenEssay("");
-            if (doc.path.rfind("/daily/", 0) != 0) {
-                save("switching");
-                openToday();
-            }
-        } else {
-            openEssay(essays[essaySelected].name);
-        }
-        closeEssayList();
+        if (selected == 0)
+            openTodayFromList();
+        else
+            openEssay(drafts[selected - 1].name);
+        closeOpenScreen();
         return;
     case tw::KeyEvent::Escape:
-        closeEssayList();
+        closeOpenScreen();
         return;
     case tw::KeyEvent::Shortcut:
         if (e.key == 'o')
-            closeEssayList();
+            closeOpenScreen();
         return;
     default:
         return;
     }
-    essaysDirty = true;
+    openDirty = true;
 }
 
 void handleKey(const tw::KeyEvent &e, uint32_t now) {
     lastKeyAt = now;
-    if (screen == Screen::Essays) {
-        handleEssayKey(e);
+    if (screen == Screen::Open) {
+        handleOpenKey(e);
         return;
     }
     if (showStatus || !notice.empty()) {
@@ -551,13 +703,9 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
         } else if (e.key == 'k' && e.shift) {
             keyboard.forget();
         } else if (e.key == 'o') {
-            openEssayList();
+            showOpenScreen();
         } else if (e.key == 'd') {
-            rememberOpenEssay("");
-            if (doc.path.rfind("/daily/", 0) != 0) {
-                save("switching");
-                openToday();
-            }
+            openTodayFromList();
         }
         return;
     case tw::KeyEvent::Up:
@@ -769,40 +917,59 @@ void drawPairing() {
     display.setTextSize(1);
 }
 
-std::string monthDay(uint32_t epoch) {
+// MM/DD/YYYY, e.g. 09/26/2026.
+std::string numericDate(uint32_t epoch) {
     if (!epoch)
         return "";
     time_t t = epoch;
     tm local;
     localtime_r(&t, &local);
     char out[16];
-    strftime(out, sizeof(out), "%b %e", &local);
+    strftime(out, sizeof(out), "%m/%d/%Y", &local);
     return out;
 }
 
-void drawEssays() {
-    const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance, listTop = top + rowH;
+void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std::string &date) {
+    const int16_t marginX = 64;
+    std::string row = (isSelected ? "› " : "  ") + label;
+    tw::drawText(display, Duo40, marginX, y + Duo40Ascent, row.c_str(), 0, row.size());
+    int32_t w = tw::measure(Duo24, date.c_str(), 0, date.size());
+    // Dates sit on the same baseline as the row's text.
+    tw::drawText(display, Duo24, display.width() - marginX - w, y + Duo40Ascent, date.c_str(), 0, date.size());
+}
+
+// Today's note, then a "Drafts" section. Drafts scroll; today's note stays put.
+void drawOpenScreen() {
+    const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
+    const int16_t labelY = top + rowH + 24;         // section label, after a gap
+    const int16_t listTop = labelY + 40;             // first draft row
     const int16_t bottom = 720 - 72;
     const size_t rows = (bottom - listTop) / rowH;
-    if (essaySelected < essayTop)
-        essayTop = essaySelected;
-    if (essaySelected >= essayTop + rows)
-        essayTop = essaySelected - rows + 1;
+    if (selected > 0) {
+        size_t i = selected - 1;
+        if (i < firstVisible)
+            firstVisible = i;
+        if (i >= firstVisible + rows)
+            firstVisible = i - rows + 1;
+    }
 
     display.clearDisplay();
-    const char *heading = "Open";
-    tw::drawText(display, Duo40, marginX, top + Duo40Ascent, heading, 0, strlen(heading));
-    for (size_t i = essayTop; i < essays.size() && i < essayTop + rows; i++) {
-        int32_t y = listTop + (i - essayTop) * rowH + Duo40Ascent;
-        std::string label = i == 0 ? "Today’s note" : essayTitle(essays[i].name);
-        std::string row = (i == essaySelected ? "› " : "  ") + label;
-        tw::drawText(display, Duo40, marginX, y, row.c_str(), 0, row.size());
-        std::string date = i == 0 ? todayName().substr(0, 10) : monthDay(essays[i].modified);
-        int32_t w = tw::measure(Duo24, date.c_str(), 0, date.size());
-        tw::drawText(display, Duo24, display.width() - marginX - w, y, date.c_str(), 0, date.size());
+    std::string today = todayName().substr(0, 10); // YYYY-MM-DD
+    std::string todayDate = today.size() == 10 ? today.substr(5, 2) + "/" + today.substr(8, 2) + "/" + today.substr(0, 4) : "";
+    drawOpenRow(top, selected == 0, "Today’s note", todayDate);
+
+    const char *label = "Drafts";
+    tw::drawText(display, Duo24, marginX, labelY + Duo24Ascent, label, 0, strlen(label));
+    if (drafts.empty()) {
+        const char *none = draftsChecking ? "Checking Dropbox…" : online() ? "No drafts in /Site/blog." : "No drafts yet. Connect to Wi-Fi to check.";
+        tw::drawText(display, Duo24, marginX, listTop + Duo24Ascent, none, 0, strlen(none));
     }
-    std::string footer = essaysProblem.empty() ? "↑↓ choose · Return open · Esc back" : essaysProblem;
-    tw::drawText(display, Duo24, marginX, 720 - 44 + Duo24Ascent, footer.c_str(), 0, footer.size());
+    for (size_t i = firstVisible; i < drafts.size() && i < firstVisible + rows; i++)
+        drawOpenRow(listTop + (i - firstVisible) * rowH, selected == i + 1, essayTitle(drafts[i].name),
+                    numericDate(drafts[i].modified));
+
+    const char *hint = "↑↓ choose · Return open · Esc back";
+    tw::drawText(display, Duo24, marginX, 720 - 44 + Duo24Ascent, hint, 0, strlen(hint));
 }
 
 void fullRefresh(const char *why) {
@@ -826,6 +993,8 @@ void setup() {
     Serial.printf("storage: %u of %u KB used\n", (unsigned)(tw::storage::usedBytes() / 1024),
                   (unsigned)(tw::storage::totalBytes() / 1024));
     tw::wallclock::begin(display);
+    tw::storage::remove("/blog/.list"); // replaced by DRAFTS_CACHE
+    drafts = draftsFrom(loadDraftsCache());
     // Reopen the essay you were writing, if any; otherwise today's note.
     Preferences prefs;
     prefs.begin("typewriter", true);
@@ -888,6 +1057,11 @@ void loop() {
         if (!doc.checkedRemote || (idle && tw::hasLocalChanges(doc.text, doc.sync)))
             startSync(doc.checkedRemote ? "idle" : "open");
     }
+    // Drafts: at startup, when the Open screen shows, and every 10 minutes.
+    if (now - lastDraftsRefreshAt > DRAFTS_REFRESH_EVERY_MS && lastDraftsRefreshAt)
+        draftsWanted = true;
+    if (draftsWanted && online() && !syncRunning && (doc.checkedRemote || doc.remotePath.empty()))
+        startDraftsRefresh();
     // Then catch up on other notes left unsynced, one at a time, while you pause.
     static uint32_t lastBacklogCheckAt = 0;
     if (idle && online() && !syncRunning && doc.checkedRemote && now - lastBacklogCheckAt > SYNC_RETRY_MS) {
@@ -918,15 +1092,15 @@ void loop() {
     if (showingPairing)
         return;
 
-    if (screen == Screen::Essays) {
-        if (forceFull || essaysDirty) {
+    if (screen == Screen::Open) {
+        if (forceFull || openDirty) {
             bool full = forceFull;
-            drawEssays();
+            drawOpenScreen();
             if (full)
                 display.display();
             else
                 display.quickPartialUpdate(true, FOOTER_PASS_US);
-            forceFull = essaysDirty = false;
+            forceFull = openDirty = false;
             panelOn = !full;
             lastUpdateAt = millis();
         }

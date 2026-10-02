@@ -44,6 +44,14 @@ class Dropbox {
         newRev = put(path, data);
         return Result::Ok;
     }
+    Result remove(const std::string &path, const std::string &rev) {
+        if (!files.count(path))
+            return Result::NotFound;
+        if (revs[path] != rev)
+            return Result::Conflict;
+        files.erase(path);
+        return Result::Ok;
+    }
     Result uploadCopy(const std::string &path, const std::string &data, std::string &savedPath) {
         savedPath = path;
         put(path, data);

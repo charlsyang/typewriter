@@ -122,7 +122,8 @@ bool Dropbox::ensureToken() {
 // One API call. RPC endpoints (api host) take arg as the JSON body; content
 // endpoints take it in the Dropbox-API-Arg header, with body as the file.
 Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std::string &arg,
-                              const std::string *body, std::string &response, std::string *apiResult) {
+                              const std::string *body, std::string &response, std::string *apiResult,
+                              const char *range) {
     if (!ensureToken())
         return Result::Error;
     bool content = strcmp(host, "content.dropboxapi.com") == 0;
@@ -138,6 +139,8 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
         http.addHeader("Authorization", String("Bearer ") + accessToken_.c_str());
         const char *collect[] = {"Dropbox-API-Result"};
         http.collectHeaders(collect, 1);
+        if (range)
+            http.addHeader("Range", range);
         if (content) {
             http.addHeader("Dropbox-API-Arg", arg.c_str());
             if (body) {
@@ -163,7 +166,7 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
             tls.stop(); // a kept-alive connection the server had closed: retry fresh
     }
 
-    if (code == 200)
+    if (code == 200 || code == 206) // 206: partial content, for a Range request
         return Result::Ok;
     if (code == 401)
         accessToken_.clear(); // expired early: sign in again next time
@@ -209,6 +212,18 @@ Dropbox::Result Dropbox::download(const std::string &path, std::string &data, st
         return Result::Error;
     rev = doc["rev"] | "";
     return Result::Ok;
+}
+
+Dropbox::Result Dropbox::downloadStart(const std::string &path, size_t maxBytes, std::string &data) {
+    std::string range = "bytes=0-" + std::to_string(maxBytes - 1);
+    return call("content.dropboxapi.com", "files/download", "{\"path\":" + jsonString(path) + "}", nullptr, data,
+                nullptr, range.c_str());
+}
+
+Dropbox::Result Dropbox::remove(const std::string &path, const std::string &rev) {
+    std::string response;
+    std::string arg = "{\"path\":" + jsonString(path) + ",\"parent_rev\":" + jsonString(rev) + "}";
+    return call("api.dropboxapi.com", "files/delete_v2", arg, nullptr, response, nullptr);
 }
 
 Dropbox::Result Dropbox::upload(const std::string &path, const std::string &data, const std::string &rev,

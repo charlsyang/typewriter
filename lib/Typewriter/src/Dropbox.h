@@ -37,6 +37,12 @@ class Dropbox {
     // Downloads a whole file and its rev.
     Result download(const std::string &path, std::string &data, std::string &rev);
 
+    // Downloads only the first maxBytes of a file (e.g. to read front matter).
+    Result downloadStart(const std::string &path, size_t maxBytes, std::string &data);
+
+    // Deletes a file (to Dropbox's Deleted files), only if it is still at rev.
+    Result remove(const std::string &path, const std::string &rev);
+
     // Uploads a whole file. With a rev, replaces the file only if it is still that
     // revision (Conflict otherwise); with an empty rev, creates it (Conflict if it
     // already exists). newRev receives the uploaded revision.
@@ -55,7 +61,7 @@ class Dropbox {
     static std::string tlsError(NetworkClientSecure &tls);
     bool ensureToken();
     Result call(const char *host, const char *endpoint, const std::string &arg, const std::string *body,
-                std::string &response, std::string *apiResult);
+                std::string &response, std::string *apiResult, const char *range = nullptr);
 
     std::string appKey_;
     std::string refreshToken_;

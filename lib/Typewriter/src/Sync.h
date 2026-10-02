@@ -39,8 +39,14 @@ struct SyncResult {
     bool textChanged = false;
 };
 
+// True if text holds nothing but spaces, tabs and line breaks.
+bool isBlank(const std::string &text);
+
 // Syncs text with remotePath and updates state. On Downloaded, Merged and
 // Conflict, text is replaced with the new shared version; on Deleted it's emptied.
-SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state);
+// With blankMeansAbsent (daily notes), a blank note is never uploaded, and
+// clearing a synced one deletes it from Dropbox.
+SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state,
+                    bool blankMeansAbsent = false);
 
 } // namespace tw

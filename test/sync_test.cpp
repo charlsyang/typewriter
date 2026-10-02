@@ -168,6 +168,55 @@ int main() {
         SyncResult r = syncFile(db, PATH, text, s);
         EXPECT(r.outcome == SyncResult::Uploaded && db.files[PATH] == "Old note. New words.");
     }
+    {
+        puts("daily note: blank and never synced is never uploaded");
+        Dropbox db;
+        SyncState s;
+        std::string text = "  \n\n ";
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::UpToDate && !db.files.count(PATH));
+    }
+    {
+        puts("daily note: blank here, laptop started one: download it");
+        Dropbox db;
+        SyncState s;
+        db.put(PATH, "Started on the laptop.");
+        std::string text = "\n";
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::Downloaded && text == "Started on the laptop.");
+    }
+    {
+        puts("daily note: cleared after syncing: deleted from Dropbox");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Some words.";
+        syncFile(db, PATH, text, s, true);
+        backspace(text, s, text.size());
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::Deleted && !db.files.count(PATH) && s.rev.empty());
+    }
+    {
+        puts("daily note: cleared here but the laptop edited it: laptop's version stays");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Some words.";
+        syncFile(db, PATH, text, s, true);
+        backspace(text, s, text.size());
+        db.put(PATH, "Some words, edited on the laptop.");
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::Downloaded && text == "Some words, edited on the laptop.");
+        EXPECT(db.files[PATH] == text);
+    }
+    {
+        puts("essay (not a daily note): clearing it uploads the empty file");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Draft.";
+        syncFile(db, PATH, text, s, false);
+        backspace(text, s, text.size());
+        SyncResult r = syncFile(db, PATH, text, s, false);
+        EXPECT(r.outcome == SyncResult::Uploaded && db.files[PATH].empty());
+    }
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;
 }

@@ -64,11 +64,16 @@ bool saveSyncState(const std::string &localPath, const SyncState &state) {
     return storage::write(statePath(localPath).c_str(), data);
 }
 
+bool isBlank(const std::string &text) {
+    return text.find_first_not_of(" \t\r\n") == std::string::npos;
+}
+
 bool hasLocalChanges(const std::string &text, const SyncState &state) {
     return text.size() != state.syncedLength || state.keptLength < state.syncedLength;
 }
 
-SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state) {
+SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state,
+                    bool blankMeansAbsent) {
     SyncResult result = {SyncResult::UpToDate, "", false};
     auto fail = [&](const char *what) {
         result.outcome = SyncResult::Failed;
@@ -81,6 +86,29 @@ SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string
     };
 
     bool localChanges = hasLocalChanges(text, state);
+
+    if (blankMeansAbsent && isBlank(text)) {
+        if (state.rev.empty()) {
+            // Nothing written here yet: never upload a blank note, but pick up
+            // one the laptop may have started.
+            localChanges = false;
+        } else if (localChanges) {
+            // You cleared a synced note: it shouldn't exist, so delete it from
+            // Dropbox (only if the laptop hasn't changed it since).
+            Dropbox::Result d = dropbox.remove(remotePath, state.rev);
+            if (d == Dropbox::Result::Ok || d == Dropbox::Result::NotFound) {
+                text.clear();
+                state = SyncState();
+                result.outcome = SyncResult::Deleted;
+                result.textChanged = true;
+                return result;
+            }
+            if (d == Dropbox::Result::Error)
+                return fail("deleting the empty note");
+            // The laptop changed it: keep the laptop's version (below).
+            localChanges = false;
+        }
+    }
 
     // The common case: you typed, the laptop didn't touch the file. One request:
     // Dropbox only accepts the upload if the file is still at our revision.
@@ -103,7 +131,7 @@ SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string
         return fail("checking Dropbox");
 
     if (r == Dropbox::Result::NotFound) {
-        if (text.empty())
+        if (text.empty() || (blankMeansAbsent && isBlank(text)))
             return result;
         // It was synced and you haven't typed since: it was deleted elsewhere
         // (e.g. on the laptop), so don't bring it back.
