@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <esp_sntp.h>
 #include <fonts/Duo24.h>
+#include <fonts/Duo28.h>
 #include <fonts/Duo40.h>
 
 tw::FastInkplate display(INKPLATE_1BIT);
@@ -917,7 +918,7 @@ void drawPairing() {
     display.setTextSize(1);
 }
 
-// MM/DD/YYYY, e.g. 09/26/2026.
+// MM-DD-YYYY, e.g. 09-26-2026.
 std::string numericDate(uint32_t epoch) {
     if (!epoch)
         return "";
@@ -925,20 +926,32 @@ std::string numericDate(uint32_t epoch) {
     tm local;
     localtime_r(&t, &local);
     char out[16];
-    strftime(out, sizeof(out), "%m/%d/%Y", &local);
+    strftime(out, sizeof(out), "%m-%d-%Y", &local);
     return out;
+}
+
+// Height of a font's capital letters above the baseline, in pixels.
+int16_t capHeight(const GFXfont &font) {
+    return -font.glyph['H' - font.first].yOffset;
+}
+
+// Where draft titles start: after the two-character selection marker.
+int32_t openTitleX() {
+    return 64 + tw::measure(Duo40, "  ", 0, 2);
 }
 
 void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std::string &date) {
     const int16_t marginX = 64;
     std::string row = (isSelected ? "› " : "  ") + label;
-    tw::drawText(display, Duo40, marginX, y + Duo40Ascent, row.c_str(), 0, row.size());
-    int32_t w = tw::measure(Duo24, date.c_str(), 0, date.size());
-    // Dates sit on the same baseline as the row's text.
-    tw::drawText(display, Duo24, display.width() - marginX - w, y + Duo40Ascent, date.c_str(), 0, date.size());
+    int32_t baseline = y + Duo40Ascent;
+    tw::drawText(display, Duo40, marginX, baseline, row.c_str(), 0, row.size());
+    // Center the date's digits on the title's capitals.
+    int32_t dateBaseline = baseline - capHeight(Duo40) / 2 + capHeight(Duo28) / 2;
+    int32_t w = tw::measure(Duo28, date.c_str(), 0, date.size());
+    tw::drawText(display, Duo28, display.width() - marginX - w, dateBaseline, date.c_str(), 0, date.size());
 }
 
-// Today's note, then a "Drafts" section. Drafts scroll; today's note stays put.
+// The daily note, then a "Drafts" section. Drafts scroll; the daily note stays put.
 void drawOpenScreen() {
     const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
     const int16_t labelY = top + rowH + 24;         // section label, after a gap
@@ -955,14 +968,14 @@ void drawOpenScreen() {
 
     display.clearDisplay();
     std::string today = todayName().substr(0, 10); // YYYY-MM-DD
-    std::string todayDate = today.size() == 10 ? today.substr(5, 2) + "/" + today.substr(8, 2) + "/" + today.substr(0, 4) : "";
-    drawOpenRow(top, selected == 0, "Today’s note", todayDate);
+    std::string todayDate = today.size() == 10 ? today.substr(5, 2) + "-" + today.substr(8, 2) + "-" + today.substr(0, 4) : "";
+    drawOpenRow(top, selected == 0, "Daily note", todayDate);
 
     const char *label = "Drafts";
-    tw::drawText(display, Duo24, marginX, labelY + Duo24Ascent, label, 0, strlen(label));
+    tw::drawText(display, Duo28, openTitleX(), labelY + Duo28Ascent, label, 0, strlen(label));
     if (drafts.empty()) {
         const char *none = draftsChecking ? "Checking Dropbox…" : online() ? "No drafts in /Site/blog." : "No drafts yet. Connect to Wi-Fi to check.";
-        tw::drawText(display, Duo24, marginX, listTop + Duo24Ascent, none, 0, strlen(none));
+        tw::drawText(display, Duo28, openTitleX(), listTop + Duo28Ascent, none, 0, strlen(none));
     }
     for (size_t i = firstVisible; i < drafts.size() && i < firstVisible + rows; i++)
         drawOpenRow(listTop + (i - firstVisible) * rowH, selected == i + 1, essayTitle(drafts[i].name),
