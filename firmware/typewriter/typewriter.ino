@@ -16,7 +16,8 @@
 // isPublished: true), all kept on the Inkplate; Cmd+D returns to today's note.
 // Drafts sync the same way. Daily notes that are blank never go to Dropbox.
 //
-// Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+S save and sync,
+// Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+Z undo and
+// Cmd+Shift+Z redo (typing or deleting), Cmd+S save and sync,
 // Cmd+I show status (file, words, saved state, power), Cmd+L full refresh, Cmd+Shift+K forget the keyboard.
 // Ctrl works in place of Cmd.
 //
@@ -28,6 +29,7 @@
 #include <Clock.h>
 #include <Dropbox.h>
 #include <FastInkplate.h>
+#include <History.h>
 #include <Keyboard.h>
 #include <Page.h>
 #include <Storage.h>
@@ -44,6 +46,7 @@
 tw::FastInkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
 tw::Keyboard keyboard;
+tw::History history; // Cmd+Z / Cmd+Shift+Z for the open document
 tw::Dropbox dropbox(DROPBOX_APP_KEY, DROPBOX_REFRESH_TOKEN);
 
 const uint32_t PASS_US = 20000;               // drive pass length chosen in Step 1
@@ -132,6 +135,7 @@ bool clockFromNetwork = false;
 // Takes copies: callers may pass the current document's own fields.
 void openDocument(std::string path, std::string remotePath, std::string name) {
     doc = Document();
+    history.clear();
     doc.path = path;
     doc.remotePath = remotePath;
     doc.name = name;
@@ -488,6 +492,7 @@ void finishSync() {
     std::string typedSince = onlyAdded ? doc.text.substr(j.snapshotSize) : "";
     if (r.textChanged) {
         if (onlyAdded) {
+            history.clear(); // the text changed underneath: old steps no longer apply
             doc.text = j.text + typedSince;
             doc.sync = j.state;
             doc.unsaved = true;
@@ -509,21 +514,30 @@ void finishSync() {
     dirty = true;
 }
 
-void deleteLastChar() {
-    while (!doc.text.empty()) {
-        uint8_t last = doc.text.back();
-        doc.text.pop_back();
-        if ((last & 0xC0) != 0x80)
+// Removes the last character (all its UTF-8 bytes); returns what was removed.
+std::string deleteLastChar() {
+    size_t cut = doc.text.size();
+    while (cut > 0) {
+        uint8_t byte = doc.text[--cut];
+        if ((byte & 0xC0) != 0x80)
             break;
     }
+    std::string removed = doc.text.substr(cut);
+    doc.text.resize(cut);
+    return removed;
 }
 
-void deleteLastWord() {
+// Option+Backspace: removes the previous word and the spaces after it.
+std::string deleteLastWord() {
     std::string &t = doc.text;
-    while (!t.empty() && (t.back() == ' ' || t.back() == '\n'))
-        t.pop_back();
-    while (!t.empty() && t.back() != ' ' && t.back() != '\n')
-        deleteLastChar();
+    size_t cut = t.size();
+    while (cut > 0 && (t[cut - 1] == ' ' || t[cut - 1] == '\n'))
+        cut--;
+    while (cut > 0 && t[cut - 1] != ' ' && t[cut - 1] != '\n')
+        cut--;
+    std::string removed = t.substr(cut);
+    t.resize(cut);
+    return removed;
 }
 
 // ---- Input ----
@@ -686,23 +700,31 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
     switch (e.type) {
     case tw::KeyEvent::Text:
         doc.text += e.text;
+        history.typed(e.text, now);
         break;
     case tw::KeyEvent::Backspace:
-        deleteLastChar();
+        history.deleted(deleteLastChar(), now);
         break;
     case tw::KeyEvent::BackspaceWord:
-        deleteLastWord();
+        history.deleted(deleteLastWord(), now);
         break;
     case tw::KeyEvent::Enter:
         doc.text += '\n';
+        history.typed("\n", now);
         break;
     case tw::KeyEvent::Tab:
         doc.text += "    ";
+        history.typed("    ", now);
         break;
     case tw::KeyEvent::Escape:
         return;
     case tw::KeyEvent::Shortcut:
-        if (e.key == 's') {
+        if (e.key == 'z') {
+            if (e.shift ? history.redo(doc.text) : history.undo(doc.text)) {
+                edited(now);
+                markChanged(now);
+            }
+        } else if (e.key == 's') {
             save("Cmd+S");
             if (doc.remotePath.empty())
                 notice = "Saved on the Inkplate. Undated notes don't sync.";
@@ -756,9 +778,9 @@ void handleSerial(uint32_t now) {
             continue;
         }
         tw::KeyEvent nav = {};
-        if (b == 0x0F || b == 0x04) { // Ctrl+O, Ctrl+D: same as Cmd+O, Cmd+D
+        if (b == 0x0F || b == 0x04 || b == 0x1A) { // Ctrl+O, Ctrl+D, Ctrl+Z: as with Cmd
             nav.type = tw::KeyEvent::Shortcut;
-            nav.key = b == 0x0F ? 'o' : 'd';
+            nav.key = b == 0x0F ? 'o' : b == 0x04 ? 'd' : 'z';
             nav.ctrl = true;
             handleKey(nav, now);
             continue;
