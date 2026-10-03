@@ -14,7 +14,9 @@
 //
 // Cmd+O lists today's note and your drafts (essays in /Site/blog without
 // isPublished: true), all kept on the Inkplate; Cmd+D returns to today's note.
-// Drafts sync the same way. Daily notes that are blank never go to Dropbox.
+// Cmd+N on the list starts a new draft, untitled.mdx (then untitled-1.mdx, ...).
+// Drafts sync the same way. Blank daily notes and blank new drafts never go to
+// Dropbox, and a new draft left blank is removed.
 //
 // ↑/↓ read back through earlier pages (full refresh each); typing returns to the
 // end. Keys: Backspace (Option+Backspace deletes a word), Return, Cmd+Z undo and
@@ -23,7 +25,8 @@
 // Ctrl works in place of Cmd.
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
-// forgets the keyboard, other bytes type text. Serial logs events and timings.
+// forgets the keyboard, Ctrl+O/D/N/Z act as Cmd, other bytes type text. Serial
+// logs events and timings.
 
 #include "secrets.h"
 
@@ -106,6 +109,8 @@ struct SyncJob {
     size_t snapshotSize; // bytes in the snapshot
     tw::SyncState state;
     bool blankMeansAbsent; // daily notes: never upload a blank note
+    bool newDraft;         // an essay started here, never synced: its name may be taken by now
+    std::string renamedTo; // the free name a new draft was uploaded under instead
     tw::SyncResult result;
     // Drafts job
     std::string openPath; // the note on screen: left to its own sync
@@ -139,8 +144,15 @@ bool clockFromNetwork = false;
 
 // ---- Document ----
 
+bool blankNewDraftOpen();
+void removeLocalCopy(const std::string &localPath);
+
 // Takes copies: callers may pass the current document's own fields.
 void openDocument(std::string path, std::string remotePath, std::string name) {
+    if (path != doc.path && blankNewDraftOpen()) {
+        Serial.printf("open: removed %s, left blank\n", doc.path.c_str());
+        removeLocalCopy(doc.path);
+    }
     doc = Document();
     history.clear();
     reading = false;
@@ -275,6 +287,34 @@ bool isMarkdown(const std::string &name) {
     return endsWith(name, ".md") || endsWith(name, ".mdx");
 }
 
+bool isEssay(const std::string &localPath) {
+    return localPath.rfind("/blog/", 0) == 0;
+}
+
+// Dropbox ignores case in names, so comparisons do too.
+std::string lowercase(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+    return s;
+}
+
+// New drafts: untitled.mdx, untitled-1.mdx, untitled-2.mdx, ...
+std::string untitledName(int n) {
+    return n == 0 ? "untitled.mdx" : "untitled-" + std::to_string(n) + ".mdx";
+}
+
+void removeLocalCopy(const std::string &localPath) {
+    tw::storage::remove(localPath.c_str());
+    tw::storage::remove((localPath + ".sync").c_str());
+}
+
+// An essay started on the Inkplate (never synced) with nothing in it yet.
+bool isBlankNewDraft(const std::string &localPath) {
+    std::string text;
+    tw::SyncState state;
+    tw::loadSyncState(localPath, state);
+    return isEssay(localPath) && state.rev.empty() && tw::storage::read(localPath.c_str(), text) && tw::isBlank(text);
+}
+
 // Background work runs in its own task, so typing never waits on the network.
 // A file sync works on a snapshot of the note; text typed meanwhile stays local
 // and goes up next time.
@@ -283,6 +323,36 @@ volatile bool syncRunning = false;
 volatile bool syncDone = false;
 size_t shortestSinceSnapshot = 0; // Backspace below the snapshot while syncing
 TaskHandle_t syncTask;
+
+bool blankNewDraftOpen() {
+    return isEssay(doc.path) && doc.sync.rev.empty() && tw::isBlank(doc.text) &&
+           !(syncRunning && syncJob.localPath == doc.path);
+}
+
+// What the list shows: drafts started here and not in Dropbox yet first, then
+// Dropbox's drafts, newest first. New drafts left blank are removed on the way.
+std::vector<DraftInfo> listDrafts(const std::vector<DraftInfo> &all) {
+    std::vector<DraftInfo> list;
+    for (const std::string &name : tw::storage::list("/blog")) {
+        if (!isMarkdown(name))
+            continue;
+        bool inDropbox = std::any_of(all.begin(), all.end(), [&](const DraftInfo &d) { return lowercase(d.name) == lowercase(name); });
+        if (inDropbox)
+            continue;
+        std::string path = "/blog/" + name;
+        if (path != doc.path && isBlankNewDraft(path)) {
+            removeLocalCopy(path);
+            continue;
+        }
+        DraftInfo d;
+        d.name = name;
+        d.draft = true;
+        list.push_back(d);
+    }
+    std::vector<DraftInfo> remote = draftsFrom(all);
+    list.insert(list.end(), remote.begin(), remote.end());
+    return list;
+}
 
 // Brings one draft's copy on the Inkplate up to date with Dropbox's, unless it
 // has changes of its own (the regular sync merges those).
@@ -354,11 +424,37 @@ void refreshDrafts(SyncJob &j) {
     }
 }
 
+// A new draft's first upload: if its name was taken in Dropbox meanwhile (the
+// laptop started an untitled.mdx too, say), take the next free untitled name
+// rather than merge into that file.
+bool pickFreeName(SyncJob &j) {
+    std::string name = j.remotePath.substr(strlen(ESSAYS) + 1);
+    for (int n = -1; n < 1000; n++) {
+        std::string candidate = n < 0 ? name : untitledName(n);
+        if (n >= 0 && (candidate == lowercase(name) || tw::storage::exists(("/blog/" + candidate).c_str())))
+            continue;
+        tw::Dropbox::Entry entry;
+        tw::Dropbox::Result r = dropbox.metadata(std::string(ESSAYS) + "/" + candidate, entry);
+        if (r == tw::Dropbox::Result::Error)
+            return false;
+        if (r == tw::Dropbox::Result::NotFound) {
+            if (n >= 0) {
+                j.renamedTo = candidate;
+                j.remotePath = std::string(ESSAYS) + "/" + candidate;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void syncTaskLoop(void *) {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (syncJob.kind == JobKind::Drafts)
             refreshDrafts(syncJob);
+        else if (syncJob.newDraft && !tw::isBlank(syncJob.text) && !pickFreeName(syncJob))
+            syncJob.result = {tw::SyncResult::Failed, "checking the name: " + dropbox.lastError(), false};
         else
             syncJob.result = tw::syncFile(dropbox, syncJob.remotePath, syncJob.text, syncJob.state,
                                           syncJob.blankMeansAbsent);
@@ -370,17 +466,29 @@ bool isDailyNote(const std::string &remotePath) {
     return remotePath.rfind(DAILY_NOTES, 0) == 0;
 }
 
+// Blank daily notes and blank new drafts stay out of Dropbox. Clearing a synced
+// daily note deletes it from Dropbox; clearing a synced essay doesn't.
+void setFileJob(SyncJob &j) {
+    j.kind = JobKind::File;
+    j.newDraft = isEssay(j.localPath) && j.state.rev.empty();
+    j.blankMeansAbsent = isDailyNote(j.remotePath) || j.newDraft;
+    j.renamedTo.clear();
+}
+
 void startSync(const char *why) {
     if (syncRunning || doc.remotePath.empty() || !online())
         return;
+    if (isEssay(doc.path) && doc.sync.rev.empty() && tw::isBlank(doc.text)) {
+        doc.checkedRemote = true; // a blank new draft: nothing to upload yet
+        return;
+    }
     save(why);
-    syncJob.kind = JobKind::File;
-    syncJob.blankMeansAbsent = isDailyNote(doc.remotePath);
     syncJob.localPath = doc.path;
     syncJob.remotePath = doc.remotePath;
     syncJob.text = doc.text;
     syncJob.snapshotSize = doc.text.size();
     syncJob.state = doc.sync;
+    setFileJob(syncJob);
     syncJob.why = why;
     syncJob.startedAt = millis();
     shortestSinceSnapshot = doc.text.size();
@@ -395,14 +503,13 @@ void startSync(const char *why) {
 void startBacklogSync(const std::string &localPath, const std::string &remotePath) {
     if (syncRunning || !online())
         return;
-    syncJob.kind = JobKind::File;
-    syncJob.blankMeansAbsent = isDailyNote(remotePath);
     syncJob.localPath = localPath;
     syncJob.remotePath = remotePath;
     if (!tw::storage::read(localPath.c_str(), syncJob.text))
         return;
     syncJob.snapshotSize = syncJob.text.size();
     tw::loadSyncState(localPath, syncJob.state);
+    setFileJob(syncJob);
     syncJob.why = "backlog";
     syncJob.startedAt = millis();
     syncDone = false;
@@ -427,9 +534,12 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
         if (path == doc.path)
             continue;
         // Only notes that have synced before: older notes written before sync
-        // existed are left for you to decide about.
+        // existed are left for you to decide about. New drafts started here
+        // are the exception, once they have something in them.
         tw::SyncState state;
-        if (!tw::loadSyncState(path, state) || state.rev.empty())
+        if (!tw::loadSyncState(path, state))
+            continue;
+        if (state.rev.empty() && (!isEssay(path) || isBlankNewDraft(path)))
             continue;
         long size = tw::storage::size(path.c_str());
         if ((size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength) {
@@ -443,6 +553,8 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
 }
 
 void finishDraftsRefresh();
+void moveNewDraft(SyncJob &j);
+void relistDrafts();
 
 // Applies a finished sync to the note (or to the file it was for, if you've
 // moved on to another note since).
@@ -457,6 +569,8 @@ void finishSync() {
         return;
     }
     const tw::SyncResult &r = j.result;
+    if (!j.renamedTo.empty() && r.outcome != tw::SyncResult::Failed)
+        moveNewDraft(j);
     static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "deleted",
                                      "FAILED"};
     Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", j.why, OUTCOMES[r.outcome],
@@ -605,7 +719,7 @@ void finishDraftsRefresh() {
         Serial.printf("drafts: couldn't list %s: %s\n", ESSAYS, dropbox.lastError().c_str());
         return;
     }
-    std::vector<DraftInfo> fresh = draftsFrom(j.all);
+    std::vector<DraftInfo> fresh = listDrafts(j.all);
     Serial.printf("drafts: %u of %u essays, %d downloaded, %d removed, %lu ms\n", (unsigned)fresh.size(),
                   (unsigned)j.all.size(), j.downloaded, j.removed, (unsigned long)(millis() - j.startedAt));
     bool changed = fresh.size() != drafts.size();
@@ -637,6 +751,59 @@ void openEssay(const std::string &name) {
     rememberOpenEssay(name);
 }
 
+// After a new draft went up under another name (see pickFreeName), its copy
+// here follows.
+void moveNewDraft(SyncJob &j) {
+    std::string to = "/blog/" + j.renamedTo;
+    Serial.printf("sync: %s was taken in Dropbox, now %s\n", j.localPath.c_str(), to.c_str());
+    if (j.localPath == doc.path) {
+        doc.path = to;
+        doc.remotePath = j.remotePath;
+        doc.name = j.renamedTo;
+        doc.unsaved = true;
+        save("renamed");
+        rememberOpenEssay(doc.name);
+    } else {
+        std::string text;
+        if (tw::storage::read(j.localPath.c_str(), text))
+            tw::storage::write(to.c_str(), text);
+    }
+    removeLocalCopy(j.localPath);
+    j.localPath = to;
+    relistDrafts();
+}
+
+// Rebuilds the list after a draft here was added, renamed or removed.
+void relistDrafts() {
+    drafts = listDrafts(loadDraftsCache());
+    if (selected > drafts.size())
+        selected = drafts.size();
+    if (screen == Screen::Open)
+        openDirty = true;
+}
+
+// Cmd+N on the list: a new, empty essay named untitled.mdx, or the next free
+// untitled-N.mdx among the essays in Dropbox and on the Inkplate.
+void startNewDraft() {
+    std::vector<DraftInfo> all = loadDraftsCache();
+    std::vector<std::string> local = tw::storage::list("/blog");
+    std::string name;
+    for (int n = 0; name.empty(); n++) {
+        std::string candidate = untitledName(n);
+        bool taken = std::any_of(all.begin(), all.end(), [&](const DraftInfo &d) { return lowercase(d.name) == candidate; }) ||
+                     std::any_of(local.begin(), local.end(), [&](const std::string &f) { return lowercase(f) == candidate; });
+        if (!taken)
+            name = candidate;
+    }
+    save("switching");
+    std::string path = "/blog/" + name;
+    tw::storage::write(path.c_str(), "");
+    tw::saveSyncState(path, tw::SyncState());
+    openDocument(path, std::string(ESSAYS) + "/" + name, name);
+    doc.checkedRemote = true; // nothing in Dropbox to pick up
+    rememberOpenEssay(name);
+}
+
 void openTodayFromList() {
     rememberOpenEssay("");
     if (doc.path.rfind("/daily/", 0) != 0) {
@@ -646,8 +813,14 @@ void openTodayFromList() {
 }
 
 void showOpenScreen() {
+    // Leaving a new draft with nothing in it: openDocument removes it.
+    if (blankNewDraftOpen()) {
+        rememberOpenEssay("");
+        openToday();
+    }
     save("opening the list");
     screen = Screen::Open;
+    drafts = listDrafts(loadDraftsCache());
     selected = 0;
     for (size_t i = 0; i < drafts.size(); i++) {
         if ("/blog/" + drafts[i].name == doc.path)
@@ -686,7 +859,9 @@ void handleOpenKey(const tw::KeyEvent &e) {
     case tw::KeyEvent::Shortcut:
         if (e.key == 'd')
             openTodayFromList();
-        if (e.key == 'o' || e.key == 'd')
+        if (e.key == 'n')
+            startNewDraft();
+        if (e.key == 'o' || e.key == 'd' || e.key == 'n')
             closeOpenScreen();
         return;
     default:
@@ -790,7 +965,9 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
             }
         } else if (e.key == 's') {
             save("Cmd+S");
-            if (doc.remotePath.empty())
+            if (blankNewDraftOpen())
+                notice = "Nothing to save yet.";
+            else if (doc.remotePath.empty())
                 notice = "Saved on the Inkplate. Undated notes don't sync.";
             else if (!online())
                 notice = "Saved on the Inkplate. It will sync when Wi-Fi is back.";
@@ -842,9 +1019,9 @@ void handleSerial(uint32_t now) {
             continue;
         }
         tw::KeyEvent nav = {};
-        if (b == 0x0F || b == 0x04 || b == 0x1A) { // Ctrl+O, Ctrl+D, Ctrl+Z: as with Cmd
+        if (b == 0x0F || b == 0x04 || b == 0x0E || b == 0x1A) { // Ctrl+O, Ctrl+D, Ctrl+N, Ctrl+Z: as with Cmd
             nav.type = tw::KeyEvent::Shortcut;
-            nav.key = b == 0x0F ? 'o' : b == 0x04 ? 'd' : 'z';
+            nav.key = b == 0x0F ? 'o' : b == 0x04 ? 'd' : b == 0x0E ? 'n' : 'z';
             nav.ctrl = true;
             handleKey(nav, now);
             continue;
@@ -1208,7 +1385,6 @@ void setup() {
     pinMode(WAKE_BUTTON, INPUT); // GPIO 36 is input-only; the board pulls it up
     tw::wallclock::begin(display);
     tw::storage::remove("/blog/.list"); // replaced by DRAFTS_CACHE
-    drafts = draftsFrom(loadDraftsCache());
     // Reopen the essay you were writing, if any; otherwise today's note.
     Preferences prefs;
     prefs.begin("typewriter", true);
