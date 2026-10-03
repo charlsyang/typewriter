@@ -14,7 +14,8 @@
 //
 // Cmd+O lists today's note and your drafts (essays in /Site/blog without
 // isPublished: true), all kept on the Inkplate; Cmd+D returns to today's note.
-// Cmd+N on the list starts a new draft, untitled.mdx (then untitled-1.mdx, ...).
+// Cmd+N on the list starts a new draft, untitled.mdx (then untitled-1.mdx, ...);
+// Cmd+S there syncs everything waiting.
 // Drafts sync the same way. Blank daily notes and blank new drafts never go to
 // Dropbox, and a new draft left blank is removed.
 //
@@ -25,7 +26,7 @@
 // Ctrl works in place of Cmd.
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
-// forgets the keyboard, Ctrl+O/D/N/Z act as Cmd, other bytes type text. Serial
+// forgets the keyboard, Ctrl+O/D/N/S/Z act as Cmd, other bytes type text. Serial
 // logs events and timings.
 
 #include "secrets.h"
@@ -521,8 +522,9 @@ void startBacklogSync(const std::string &localPath, const std::string &remotePat
     xTaskNotifyGive(syncTask);
 }
 
-// Looks for another note or essay in flash with changes Dropbox doesn't have yet.
-bool findBacklog(std::string &localPath, std::string &remotePath) {
+// Looks for another note or essay in flash with changes Dropbox doesn't have yet
+// (other than those in skip).
+bool findBacklog(std::string &localPath, std::string &remotePath, const std::vector<std::string> &skip = {}) {
     struct Folder {
         const char *local;
         std::string remote;
@@ -535,7 +537,7 @@ bool findBacklog(std::string &localPath, std::string &remotePath) {
         if (!isMarkdown(name) || name == "undated.md")
             continue;
         std::string path = folder.local + name;
-        if (path == doc.path)
+        if (path == doc.path || std::find(skip.begin(), skip.end(), path) != skip.end())
             continue;
         // Only notes that have synced before: older notes written before sync
         // existed are left for you to decide about. New drafts started here
@@ -560,6 +562,14 @@ void finishDraftsRefresh();
 void moveNewDraft(SyncJob &j);
 void relistDrafts();
 
+// Cmd+S on the list: syncs the open note, then every other file waiting, then
+// refreshes the list, one after another.
+bool syncAllActive = false;
+bool syncAllListed = false;
+bool syncAllFailed = false;
+std::vector<std::string> syncAllTried; // local paths synced this round (a failure isn't retried)
+std::string openNotice;                // the list's footer until the next key
+
 // Applies a finished sync to the note (or to the file it was for, if you've
 // moved on to another note since).
 void finishSync() {
@@ -573,6 +583,8 @@ void finishSync() {
         return;
     }
     const tw::SyncResult &r = j.result;
+    if (syncAllActive && r.outcome == tw::SyncResult::Failed)
+        syncAllFailed = true;
     if (!j.renamedTo.empty() && r.outcome != tw::SyncResult::Failed)
         moveNewDraft(j);
     static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "deleted",
@@ -719,6 +731,8 @@ void startDraftsRefresh() {
 void finishDraftsRefresh() {
     SyncJob &j = syncJob;
     draftsChecking = false;
+    if (syncAllActive && !j.listed)
+        syncAllFailed = true;
     if (!j.listed) {
         Serial.printf("drafts: couldn't list %s: %s\n", ESSAYS, dropbox.lastError().c_str());
         return;
@@ -824,6 +838,7 @@ void showOpenScreen() {
     }
     save("opening the list");
     screen = Screen::Open;
+    openNotice.clear();
     drafts = listDrafts(loadDraftsCache());
     selected = 0;
     for (size_t i = 0; i < drafts.size(); i++) {
@@ -840,7 +855,52 @@ void closeOpenScreen() {
     forceFull = true;
 }
 
+void startSyncAll() {
+    save("Cmd+S");
+    if (!online()) {
+        openNotice = "Saved offline. Connect to Wi-Fi to sync.";
+        return;
+    }
+    syncAllActive = true;
+    syncAllListed = syncAllFailed = false;
+    syncAllTried.clear();
+    openNotice = "Syncing…";
+}
+
+// Starts the next step of a Cmd+S sync when the last one is done.
+void continueSyncAll() {
+    if (!syncAllActive || syncRunning)
+        return;
+    std::string local, remote;
+    if (!online()) {
+        syncAllActive = false;
+        openNotice = "Saved offline. Connect to Wi-Fi to sync.";
+    } else if (!doc.remotePath.empty() &&
+               std::find(syncAllTried.begin(), syncAllTried.end(), doc.path) == syncAllTried.end()) {
+        syncAllTried.push_back(doc.path);
+        startSync("Cmd+S"); // a blank new draft starts nothing
+        return;
+    } else if (findBacklog(local, remote, syncAllTried)) {
+        syncAllTried.push_back(local);
+        startBacklogSync(local, remote);
+        return;
+    } else if (!syncAllListed) {
+        syncAllListed = true;
+        startDraftsRefresh();
+        return;
+    } else {
+        syncAllActive = false;
+        openNotice = syncAllFailed ? "Couldn’t sync everything. Saved on the Inkplate." : "Synced.";
+    }
+    if (screen == Screen::Open)
+        openDirty = true;
+}
+
 void handleOpenKey(const tw::KeyEvent &e) {
+    if (!openNotice.empty() && !syncAllActive) {
+        openNotice.clear();
+        openDirty = true;
+    }
     switch (e.type) {
     case tw::KeyEvent::Up:
         if (selected > 0)
@@ -867,6 +927,10 @@ void handleOpenKey(const tw::KeyEvent &e) {
             startNewDraft();
         if (e.key == 'o' || e.key == 'd' || e.key == 'n')
             closeOpenScreen();
+        if (e.key == 's') {
+            startSyncAll();
+            openDirty = true;
+        }
         return;
     default:
         return;
@@ -1023,9 +1087,9 @@ void handleSerial(uint32_t now) {
             continue;
         }
         tw::KeyEvent nav = {};
-        if (b == 0x0F || b == 0x04 || b == 0x0E || b == 0x1A) { // Ctrl+O, Ctrl+D, Ctrl+N, Ctrl+Z: as with Cmd
+        if (b == 0x0F || b == 0x04 || b == 0x0E || b == 0x13 || b == 0x1A) { // Ctrl+O/D/N/S/Z: as with Cmd
             nav.type = tw::KeyEvent::Shortcut;
-            nav.key = b == 0x0F ? 'o' : b == 0x04 ? 'd' : b == 0x0E ? 'n' : 'z';
+            nav.key = b == 0x0F ? 'o' : b == 0x04 ? 'd' : b == 0x0E ? 'n' : b == 0x13 ? 's' : 'z';
             nav.ctrl = true;
             handleKey(nav, now);
             continue;
@@ -1465,6 +1529,7 @@ void loop() {
         save("day ended");
         openToday();
     }
+    continueSyncAll(); // Cmd+S on the list goes first
     // Sync: when the note opens (to pick up laptop edits), then after pauses.
     bool retryWait = doc.syncFailures && now - doc.lastSyncAttemptAt < SYNC_RETRY_MS;
     if (online() && !retryWait && !doc.remotePath.empty()) {
@@ -1509,7 +1574,7 @@ void loop() {
     if (screen == Screen::Open) {
         if (forceFull || openDirty) {
             bool full = forceFull;
-            drawOpenScreen();
+            drawOpenScreen(openNotice.empty() ? nullptr : openNotice.c_str());
             if (full)
                 display.display();
             else
