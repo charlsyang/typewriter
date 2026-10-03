@@ -1613,7 +1613,9 @@ void loop() {
             startSync(doc.checkedRemote ? "idle" : "open");
     }
     // Drafts: at startup, when the Open screen shows, and every 10 minutes.
-    if (now - lastDraftsRefreshAt > DRAFTS_REFRESH_EVERY_MS && lastDraftsRefreshAt)
+    // millis(), not now: a refresh started earlier in this pass (Cmd+S) is later
+    // than now, and the subtraction would wrap around to "long ago".
+    if (millis() - lastDraftsRefreshAt > DRAFTS_REFRESH_EVERY_MS && lastDraftsRefreshAt)
         draftsWanted = true;
     if (draftsWanted && online() && !syncRunning && (doc.checkedRemote || doc.remotePath.empty()))
         startDraftsRefresh();
