@@ -17,6 +17,7 @@ struct SyncState {
     std::string rev;          // Dropbox revision both sides last agreed on ("" = never synced)
     size_t syncedLength = 0;  // bytes of text at that point
     size_t keptLength = 0;    // fewest bytes since then: Backspace below syncedLength means a deletion
+    std::string id;           // Dropbox file ID ("" until learned), to follow renames
 };
 
 bool loadSyncState(const std::string &localPath, SyncState &state);
@@ -33,9 +34,10 @@ struct SyncResult {
         Merged,     // both changed; the Inkplate's new text was added to the end
         Conflict,   // both changed; the Inkplate's version was saved as a copy
         Deleted,    // deleted in Dropbox and unchanged here: text cleared too
+        Moved,      // renamed in Dropbox within the same folder: message is the new path; nothing synced yet
         Failed,
     } outcome;
-    std::string message; // for Failed and Conflict
+    std::string message; // for Failed, Conflict and Moved
     bool textChanged = false;
 };
 
@@ -45,7 +47,9 @@ bool isBlank(const std::string &text);
 // Syncs text with remotePath and updates state. On Downloaded, Merged and
 // Conflict, text is replaced with the new shared version; on Deleted it's emptied.
 // With blankMeansAbsent (daily notes), a blank note is never uploaded, and
-// clearing a synced one deletes it from Dropbox.
+// clearing a synced one deletes it from Dropbox. A file missing from remotePath
+// is looked up by its ID: renamed within the same folder, it's Moved; anywhere
+// else, or gone, it's treated as deleted.
 SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state,
                     bool blankMeansAbsent = false);
 

@@ -1,4 +1,5 @@
 // Host tests for lib/Typewriter/src/Sync.cpp. Run: test/run.sh
+#include "Storage.h"
 #include "Sync.h"
 
 #include <cstdio>
@@ -216,6 +217,113 @@ int main() {
         backspace(text, s, text.size());
         SyncResult r = syncFile(db, PATH, text, s, false);
         EXPECT(r.outcome == SyncResult::Uploaded && db.files[PATH].empty());
+    }
+    {
+        puts("the file ID is learned on upload, and an older state learns it on a check");
+        Dropbox db;
+        SyncState s;
+        std::string text = "Words.";
+        syncFile(db, PATH, text, s);
+        EXPECT(!s.id.empty() && s.id == db.ids[PATH]);
+        s.id.clear(); // as saved before IDs were kept
+        EXPECT(syncFile(db, PATH, text, s).outcome == SyncResult::UpToDate && s.id == db.ids[PATH]);
+    }
+    {
+        puts("renamed in the same folder: Moved, with the new path, nothing changed");
+        Dropbox db;
+        SyncState s;
+        std::string text = "An essay.";
+        const std::string from = "/Site/blog/untitled.mdx", to = "/Site/blog/my-essay.mdx";
+        syncFile(db, from, text, s);
+        db.move(from, to);
+        SyncResult r = syncFile(db, from, text, s);
+        EXPECT(r.outcome == SyncResult::Moved && r.message == to);
+        EXPECT(text == "An essay." && !db.files.count(from));
+        EXPECT(syncFile(db, to, text, s).outcome == SyncResult::UpToDate);
+    }
+    {
+        puts("renamed, and typed here since: Moved, then the new text goes to the new name");
+        Dropbox db;
+        SyncState s;
+        std::string text = "An essay.";
+        const std::string from = "/Site/blog/untitled.mdx", to = "/Site/blog/my-essay.mdx";
+        syncFile(db, from, text, s);
+        db.move(from, to);
+        type(text, s, " More.");
+        SyncResult r = syncFile(db, from, text, s);
+        EXPECT(r.outcome == SyncResult::Moved && r.message == to && !db.files.count(from));
+        r = syncFile(db, to, text, s);
+        EXPECT(r.outcome == SyncResult::Uploaded && db.files[to] == "An essay. More." && !db.files.count(from));
+    }
+    {
+        puts("renamed and edited on the laptop: Moved, then merged at the new name");
+        Dropbox db;
+        SyncState s;
+        std::string text = "An essay.";
+        const std::string from = "/Site/blog/untitled.mdx", to = "/Site/blog/my-essay.mdx";
+        syncFile(db, from, text, s);
+        db.move(from, to);
+        db.put(to, "An essay, edited.");
+        type(text, s, " More.");
+        EXPECT(syncFile(db, from, text, s).outcome == SyncResult::Moved);
+        SyncResult r = syncFile(db, to, text, s);
+        EXPECT(r.outcome == SyncResult::Merged && db.files[to] == "An essay, edited.\n\nMore.");
+    }
+    {
+        puts("renamed, typed here, and Dropbox makes a new file at the old name: undone, then Moved");
+        Dropbox db;
+        db.updateCreatesMissing = true;
+        SyncState s;
+        std::string text = "An essay.";
+        const std::string from = "/Site/blog/untitled.mdx", to = "/Site/blog/my-essay.mdx";
+        syncFile(db, from, text, s);
+        db.move(from, to);
+        type(text, s, " More.");
+        SyncResult r = syncFile(db, from, text, s);
+        EXPECT(r.outcome == SyncResult::Moved && r.message == to && !db.files.count(from));
+    }
+    {
+        puts("moved to another folder: treated as deleted (nothing typed) or uploaded again (typed)");
+        Dropbox db;
+        SyncState s;
+        std::string text = "An essay.";
+        const std::string from = "/Site/blog/untitled.mdx";
+        syncFile(db, from, text, s);
+        db.move(from, "/Archive/untitled.mdx");
+        SyncResult r = syncFile(db, from, text, s);
+        EXPECT(r.outcome == SyncResult::Deleted && text.empty());
+
+        Dropbox db2;
+        SyncState s2;
+        std::string text2 = "An essay.";
+        syncFile(db2, from, text2, s2);
+        db2.move(from, "/Archive/untitled.mdx");
+        type(text2, s2, " More.");
+        r = syncFile(db2, from, text2, s2);
+        EXPECT(r.outcome == SyncResult::Uploaded && db2.files[from] == "An essay. More.");
+    }
+    {
+        puts("a rename differing only in folder case still counts as the same folder");
+        Dropbox db;
+        SyncState s;
+        std::string text = "An essay.";
+        syncFile(db, "/Site/blog/a.mdx", text, s);
+        db.move("/Site/blog/a.mdx", "/site/Blog/b.mdx");
+        EXPECT(syncFile(db, "/Site/blog/a.mdx", text, s).outcome == SyncResult::Moved);
+    }
+    {
+        puts("sync state keeps the file ID, and older three-line files still load");
+        SyncState s;
+        s.rev = "r7";
+        s.syncedLength = 12;
+        s.keptLength = 10;
+        s.id = "id:abc";
+        saveSyncState("/blog/a.mdx", s);
+        SyncState back;
+        EXPECT(loadSyncState("/blog/a.mdx", back) && back.rev == "r7" && back.syncedLength == 12 &&
+               back.keptLength == 10 && back.id == "id:abc");
+        storage::write("/blog/old.mdx.sync", "r3\n5\n5\n");
+        EXPECT(loadSyncState("/blog/old.mdx", back) && back.rev == "r3" && back.id.empty());
     }
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;

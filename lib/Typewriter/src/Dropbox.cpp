@@ -57,6 +57,7 @@ uint32_t parseTime(const char *iso) {
 void readEntry(JsonObjectConst o, Dropbox::Entry &e) {
     e.name = o["name"] | "";
     e.path = o["path_display"] | "";
+    e.id = o["id"] | "";
     e.rev = o["rev"] | "";
     e.modified = parseTime(o["server_modified"] | "");
     e.folder = strcmp(o[".tag"] | "", "folder") == 0;
@@ -201,7 +202,7 @@ Dropbox::Result Dropbox::metadata(const std::string &path, Entry &out) {
     return Result::Ok;
 }
 
-Dropbox::Result Dropbox::download(const std::string &path, std::string &data, std::string &rev) {
+Dropbox::Result Dropbox::download(const std::string &path, std::string &data, std::string &rev, std::string *id) {
     std::string apiResult;
     Result r = call("content.dropboxapi.com", "files/download", "{\"path\":" + jsonString(path) + "}", nullptr,
                     data, &apiResult);
@@ -211,6 +212,8 @@ Dropbox::Result Dropbox::download(const std::string &path, std::string &data, st
     if (deserializeJson(doc, apiResult))
         return Result::Error;
     rev = doc["rev"] | "";
+    if (id)
+        *id = doc["id"] | "";
     return Result::Ok;
 }
 
@@ -227,7 +230,7 @@ Dropbox::Result Dropbox::remove(const std::string &path, const std::string &rev)
 }
 
 Dropbox::Result Dropbox::upload(const std::string &path, const std::string &data, const std::string &rev,
-                                std::string &newRev) {
+                                std::string &newRev, std::string *newId) {
     std::string mode = rev.empty() ? "\"add\"" : "{\".tag\":\"update\",\"update\":" + jsonString(rev) + "}";
     std::string arg = "{\"path\":" + jsonString(path) + ",\"mode\":" + mode + ",\"autorename\":false,\"mute\":true}";
     std::string response;
@@ -238,6 +241,8 @@ Dropbox::Result Dropbox::upload(const std::string &path, const std::string &data
     if (deserializeJson(doc, response))
         return Result::Error;
     newRev = doc["rev"] | "";
+    if (newId)
+        *newId = doc["id"] | "";
     return Result::Ok;
 }
 

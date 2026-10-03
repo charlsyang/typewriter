@@ -117,7 +117,7 @@ struct SyncJob {
     std::string openPath; // the note on screen: left to its own sync
     std::vector<DraftInfo> all;
     bool listed;
-    int downloaded, removed;
+    int downloaded, removed, renamed;
     const char *why;
     uint32_t startedAt;
 };
@@ -308,6 +308,16 @@ void removeLocalCopy(const std::string &localPath) {
     tw::storage::remove((localPath + ".sync").c_str());
 }
 
+// Renames a note's copy here, with its sync state.
+void moveLocalCopy(const std::string &from, const std::string &to) {
+    std::string text, state;
+    if (tw::storage::read(from.c_str(), text))
+        tw::storage::write(to.c_str(), text);
+    if (tw::storage::read((from + ".sync").c_str(), state))
+        tw::storage::write((to + ".sync").c_str(), state);
+    removeLocalCopy(from);
+}
+
 // An essay started on the Inkplate (never synced) with nothing in it yet.
 bool isBlankNewDraft(const std::string &localPath) {
     std::string text;
@@ -374,24 +384,44 @@ bool fetchDraft(const DraftInfo &d) {
     tw::loadSyncState(local, state);
     if (exists && (state.rev == d.rev || tw::hasLocalChanges(text, state)))
         return false;
-    std::string rev;
-    if (dropbox.download(std::string(ESSAYS) + "/" + d.name, text, rev) != tw::Dropbox::Result::Ok)
+    std::string rev, id;
+    if (dropbox.download(std::string(ESSAYS) + "/" + d.name, text, rev, &id) != tw::Dropbox::Result::Ok)
         return false;
     state.rev = rev;
+    state.id = id;
     state.syncedLength = state.keptLength = text.size();
     return tw::storage::write(local.c_str(), text) && tw::saveSyncState(local, state);
 }
 
 // Lists /Site/blog, sorts drafts from published essays (reading only the start
 // of files that changed since last time), keeps every draft on the Inkplate,
-// and removes copies of essays that are now published or gone.
+// follows drafts renamed on the laptop (by Dropbox file ID), and removes copies
+// of essays that are now published or gone.
 void refreshDrafts(SyncJob &j) {
-    j.downloaded = j.removed = 0;
+    j.downloaded = j.removed = j.renamed = 0;
     std::vector<tw::Dropbox::Entry> entries;
     j.listed = dropbox.list(ESSAYS, entries) == tw::Dropbox::Result::Ok;
     if (!j.listed)
         return;
     std::vector<DraftInfo> cached = loadDraftsCache();
+    std::vector<std::pair<std::string, std::string>> localIds; // file ID, name here
+    for (const std::string &name : tw::storage::list("/blog")) {
+        std::string path = "/blog/" + name;
+        tw::SyncState state;
+        if (!isMarkdown(name) || !tw::loadSyncState(path, state) || state.rev.empty())
+            continue;
+        if (state.id.empty() && path != j.openPath) {
+            // Copies synced before IDs were kept: the listing has them.
+            for (const tw::Dropbox::Entry &e : entries) {
+                if (e.name == name && e.rev == state.rev && !e.id.empty()) {
+                    state.id = e.id;
+                    tw::saveSyncState(path, state);
+                }
+            }
+        }
+        if (!state.id.empty())
+            localIds.push_back({state.id, name});
+    }
     j.all.clear();
     for (const tw::Dropbox::Entry &e : entries) {
         if (e.folder || !isMarkdown(e.name))
@@ -410,7 +440,21 @@ void refreshDrafts(SyncJob &j) {
             d.draft = isDraftText(start);
         }
         j.all.push_back(d);
-        if (d.draft && "/blog/" + d.name != j.openPath && fetchDraft(d))
+        // Here under its old name? Rename the copy, rather than fetch the file
+        // again and drop the old one. The open note's own sync follows it.
+        bool openUnderOldName = false;
+        for (const auto &local : localIds) {
+            if (local.first != e.id || local.second == e.name)
+                continue;
+            std::string from = "/blog/" + local.second, to = "/blog/" + e.name;
+            if (from == j.openPath) {
+                openUnderOldName = true;
+            } else if (d.draft && !tw::storage::exists(to.c_str())) {
+                moveLocalCopy(from, to);
+                j.renamed++;
+            }
+        }
+        if (d.draft && !openUnderOldName && "/blog/" + d.name != j.openPath && fetchDraft(d))
             j.downloaded++;
     }
     saveDraftsCache(j.all);
@@ -565,6 +609,7 @@ bool findBacklog(std::string &localPath, std::string &remotePath, const std::vec
 
 void finishDraftsRefresh();
 void moveNewDraft(SyncJob &j);
+void followRename(SyncJob &j, const std::string &newRemotePath);
 void showOpenScreen();
 void relistDrafts();
 std::string essayTitle(const std::string &name);
@@ -596,10 +641,14 @@ void finishSync() {
     if (!j.renamedTo.empty() && r.outcome != tw::SyncResult::Failed)
         moveNewDraft(j);
     static const char *OUTCOMES[] = {"up to date", "uploaded", "downloaded", "merged", "conflict", "deleted",
-                                     "FAILED"};
+                                     "moved", "FAILED"};
     Serial.printf("sync (%s): %s in %lu ms, rev %s %s\n", j.why, OUTCOMES[r.outcome],
                   (unsigned long)(millis() - j.startedAt), j.state.rev.c_str(), r.message.c_str());
 
+    if (r.outcome == tw::SyncResult::Moved) {
+        followRename(j, r.message);
+        return;
+    }
     if (r.outcome == tw::SyncResult::Deleted) {
         bool open = j.localPath == doc.path;
         if (open && (shortestSinceSnapshot < j.snapshotSize || doc.text.size() != j.snapshotSize)) {
@@ -764,8 +813,8 @@ void finishDraftsRefresh() {
         return;
     }
     std::vector<DraftInfo> fresh = listDrafts(j.all);
-    Serial.printf("drafts: %u of %u essays, %d downloaded, %d removed, %lu ms\n", (unsigned)fresh.size(),
-                  (unsigned)j.all.size(), j.downloaded, j.removed, (unsigned long)(millis() - j.startedAt));
+    Serial.printf("drafts: %u of %u essays, %d downloaded, %d renamed, %d removed, %lu ms\n", (unsigned)fresh.size(),
+                  (unsigned)j.all.size(), j.downloaded, j.renamed, j.removed, (unsigned long)(millis() - j.startedAt));
     bool changed = fresh.size() != drafts.size();
     for (size_t i = 0; !changed && i < fresh.size(); i++)
         changed = fresh[i].name != drafts[i].name || fresh[i].modified != drafts[i].modified;
@@ -795,26 +844,59 @@ void openEssay(const std::string &name) {
     rememberOpenEssay(name);
 }
 
+// Renames a note's copy here, with its sync state. If it's the open note, the
+// document follows.
+void relocate(const std::string &from, const std::string &to, const std::string &toRemote) {
+    if (from != doc.path) {
+        moveLocalCopy(from, to);
+        return;
+    }
+    doc.path = to;
+    doc.remotePath = toRemote;
+    doc.name = to.substr(to.rfind('/') + 1);
+    doc.unsaved = true;
+    save("renamed"); // the text and sync state, under the new name
+    if (isEssay(to))
+        rememberOpenEssay(doc.name);
+    removeLocalCopy(from);
+}
+
 // After a new draft went up under another name (see pickFreeName), its copy
 // here follows.
 void moveNewDraft(SyncJob &j) {
     std::string to = "/blog/" + j.renamedTo;
     Serial.printf("sync: %s was taken in Dropbox, now %s\n", j.localPath.c_str(), to.c_str());
-    if (j.localPath == doc.path) {
-        doc.path = to;
-        doc.remotePath = j.remotePath;
-        doc.name = j.renamedTo;
-        doc.unsaved = true;
-        save("renamed");
-        rememberOpenEssay(doc.name);
-    } else {
-        std::string text;
-        if (tw::storage::read(j.localPath.c_str(), text))
-            tw::storage::write(to.c_str(), text);
-    }
-    removeLocalCopy(j.localPath);
+    relocate(j.localPath, to, j.remotePath);
     j.localPath = to;
     relistDrafts();
+}
+
+// Renamed in Dropbox, in the same folder: the copy here takes the new name
+// and syncs again there, edits and all.
+void followRename(SyncJob &j, const std::string &newRemotePath) {
+    std::string to = j.localPath.substr(0, j.localPath.rfind('/') + 1) + newRemotePath.substr(newRemotePath.rfind('/') + 1);
+    if (to != j.localPath && tw::storage::exists(to.c_str())) {
+        // A list refresh already fetched it under the new name. Ours has the
+        // sync state (and any edits), so it wins, unless that copy has edits too.
+        std::string text;
+        tw::SyncState state;
+        tw::storage::read(to.c_str(), text);
+        tw::loadSyncState(to, state);
+        if (tw::hasLocalChanges(text, state)) {
+            Serial.printf("sync: %s was renamed to %s, but that has edits here too: leaving both\n",
+                          j.localPath.c_str(), to.c_str());
+            return;
+        }
+        removeLocalCopy(to);
+    }
+    Serial.printf("sync: %s was renamed in Dropbox, now %s\n", j.localPath.c_str(), to.c_str());
+    bool open = j.localPath == doc.path;
+    relocate(j.localPath, to, newRemotePath);
+    if (open)
+        doc.checkedRemote = false; // sync again now, under the new name
+    j.localPath = to;
+    if (isEssay(to))
+        relistDrafts();
 }
 
 // Rebuilds the list after a draft here was added, renamed or removed.

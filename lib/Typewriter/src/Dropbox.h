@@ -17,6 +17,7 @@ class Dropbox {
     struct Entry {
         std::string name;
         std::string path; // as Dropbox displays it
+        std::string id;   // "id:...", kept through renames and moves
         std::string rev;
         uint32_t modified = 0; // server_modified, seconds since epoch
         bool folder = false;
@@ -31,11 +32,11 @@ class Dropbox {
 
     Dropbox(const char *appKey, const char *refreshToken);
 
-    // Metadata for one file: rev and modified time.
+    // Metadata for one file: rev and modified time. path may be a file ID ("id:...").
     Result metadata(const std::string &path, Entry &out);
 
-    // Downloads a whole file and its rev.
-    Result download(const std::string &path, std::string &data, std::string &rev);
+    // Downloads a whole file and its rev (and file ID, if id is given).
+    Result download(const std::string &path, std::string &data, std::string &rev, std::string *id = nullptr);
 
     // Downloads only the first maxBytes of a file (e.g. to read front matter).
     Result downloadStart(const std::string &path, size_t maxBytes, std::string &data);
@@ -45,8 +46,9 @@ class Dropbox {
 
     // Uploads a whole file. With a rev, replaces the file only if it is still that
     // revision (Conflict otherwise); with an empty rev, creates it (Conflict if it
-    // already exists). newRev receives the uploaded revision.
-    Result upload(const std::string &path, const std::string &data, const std::string &rev, std::string &newRev);
+    // already exists). newRev receives the uploaded revision (newId the file ID).
+    Result upload(const std::string &path, const std::string &data, const std::string &rev, std::string &newRev,
+                  std::string *newId = nullptr);
 
     // Uploads next to path with Dropbox picking a free name, for conflicted copies.
     Result uploadCopy(const std::string &path, const std::string &data, std::string &savedPath);
