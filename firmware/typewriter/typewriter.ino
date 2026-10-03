@@ -7,8 +7,8 @@
 // line appears when something needs attention, or on Cmd+I.
 //
 // After 10 minutes without typing, or a press of the WAKE button, it saves,
-// syncs and deep-sleeps, leaving the page on screen; WAKE resumes where you
-// were. Switching on starts at the list.
+// syncs and deep-sleeps showing the list, so your writing isn't left on screen.
+// Waking and switching on both start at the list.
 //
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
@@ -116,9 +116,8 @@ struct SyncJob {
     uint32_t startedAt;
 };
 
-// Kept in RTC memory through deep sleep, so waking returns to the same screen.
+// Kept in RTC memory through deep sleep, to tell waking from switching on.
 RTC_DATA_ATTR bool resumeAfterSleep = false;
-RTC_DATA_ATTR bool resumeOnList = false;
 void goToSleep(uint32_t wakeAfterSeconds = 0);
 void checkBattery(uint32_t now, bool force = false);
 
@@ -1145,8 +1144,9 @@ void waitForBackground(uint32_t limitMs) {
     finishSync();
 }
 
-// Saves, syncs what it can, leaves the current screen up with a small note, and
-// sleeps until the WAKE button. Waking restarts the program; setup() resumes.
+// Saves, syncs what it can, shows the list with a small note (so your writing
+// isn't left on screen), and sleeps until the WAKE button. Waking restarts the
+// program at the list.
 void goToSleep(uint32_t wakeAfterSeconds) {
     Serial.println("sleep: going to sleep");
     save("sleep");
@@ -1156,13 +1156,11 @@ void goToSleep(uint32_t wakeAfterSeconds) {
         waitForBackground(30000);
     }
     resumeAfterSleep = true;
-    resumeOnList = screen == Screen::Open;
-    reading = false; // sleep shows (and wakes to) the page you're writing
+    reading = false;
+    if (screen != Screen::Open)
+        showOpenScreen();
     // A full refresh: the resting image should be clean, with no ghosting.
-    if (screen == Screen::Open)
-        drawOpenScreen(ASLEEP);
-    else
-        page.render(doc.text, ASLEEP, nullptr);
+    drawOpenScreen(ASLEEP);
     display.display();
     display.einkOff();
     WiFi.disconnect(true);
@@ -1220,13 +1218,12 @@ void setup() {
         openEssay(essay.c_str());
     else
         openToday();
-    // Waking from sleep returns to the screen you left; switching on starts at
-    // the list, with that note selected.
+    // Waking from sleep and switching on both start at the list, with that note
+    // selected.
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     bool woke = (cause == ESP_SLEEP_WAKEUP_EXT0 || cause == ESP_SLEEP_WAKEUP_TIMER) && resumeAfterSleep;
-    Serial.printf("start: %s\n", woke ? (resumeOnList ? "woke, back to the list" : "woke, back to writing") : "power on");
-    if (!woke || resumeOnList)
-        showOpenScreen();
+    Serial.printf("start: %s\n", woke ? "woke" : "power on");
+    showOpenScreen();
     resumeAfterSleep = false;
     lastKeyAt = millis(); // the sleep timer starts now
     keyboard.begin("Typewriter");
