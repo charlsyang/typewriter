@@ -1362,7 +1362,9 @@ void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std
 }
 
 // The daily note, then a "Drafts" section. Drafts scroll; the daily note stays put.
-void drawOpenScreen(const char *hintOverride = nullptr) {
+// The footer has the key hint on the left and status (syncing) on the right; the
+// hint gives way when both don't fit. Asleep, the status alone is centered.
+void drawOpenScreen(const char *status = nullptr, bool asleep = false) {
     const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
     const int16_t labelY = top + rowH + 48;         // section label, after a gap
     const int16_t listTop = labelY + 60;             // first draft row
@@ -1392,8 +1394,16 @@ void drawOpenScreen(const char *hintOverride = nullptr) {
         drawOpenRow(listTop + (i - firstVisible) * rowH, selected == i + 1, essayTitle(drafts[i].name),
                     numericDate(drafts[i].modified));
 
-    const char *hint = hintOverride ? hintOverride : "↑↓ choose · Return open · Esc back";
-    tw::drawText(display, Duo24, marginX, 720 - 44 + Duo24Ascent, hint, 0, strlen(hint));
+    const int32_t baseline = 720 - 44 + Duo24Ascent;
+    const char *hint = "↑↓ choose · Return open · Esc back";
+    int32_t hintW = tw::measure(Duo24, hint, 0, strlen(hint));
+    int32_t statusW = status ? tw::measure(Duo24, status, 0, strlen(status)) : 0;
+    const int32_t gap = 48;
+    if (!asleep && (!status || hintW + gap + statusW <= display.width() - 2 * marginX))
+        tw::drawText(display, Duo24, marginX, baseline, hint, 0, strlen(hint));
+    int32_t statusX = asleep ? (display.width() - statusW) / 2 : display.width() - marginX - statusW;
+    if (status)
+        tw::drawText(display, Duo24, statusX, baseline, status, 0, strlen(status));
 }
 
 void fullRefresh(const char *why) {
@@ -1432,7 +1442,7 @@ void goToSleep(uint32_t wakeAfterSeconds) {
     if (screen != Screen::Open)
         showOpenScreen();
     // A full refresh: the resting image should be clean, with no ghosting.
-    drawOpenScreen(ASLEEP);
+    drawOpenScreen(ASLEEP, true);
     display.display();
     display.einkOff();
     WiFi.disconnect(true);
