@@ -1361,22 +1361,62 @@ void drawOpenRow(int32_t y, bool isSelected, const std::string &label, const std
     tw::drawText(display, Duo28, display.width() - marginX - w, dateBaseline, date.c_str(), 0, date.size());
 }
 
+// Where the Open screen's rows go.
+const int16_t OPEN_TOP = 64;                              // the daily note row
+const int16_t OPEN_LABEL_Y = OPEN_TOP + Duo40.yAdvance + 48; // "Drafts", after a gap
+const int16_t OPEN_LIST_TOP = OPEN_LABEL_Y + 60;           // first draft row
+const size_t OPEN_ROWS = (720 - 72 - OPEN_LIST_TOP) / Duo40.yAdvance;
+
+// Scrolls the drafts so the selected one is on screen.
+void scrollOpenList() {
+    if (selected == 0)
+        return;
+    size_t i = selected - 1;
+    if (i < firstVisible)
+        firstVisible = i;
+    if (i >= firstVisible + OPEN_ROWS)
+        firstVisible = i - OPEN_ROWS + 1;
+}
+
+// Top of a row on screen (0: the daily note), or -1 if it's scrolled off.
+int32_t openRowTop(size_t row) {
+    if (row == 0)
+        return OPEN_TOP;
+    if (row - 1 < firstVisible || row - 1 >= firstVisible + OPEN_ROWS)
+        return -1;
+    return OPEN_LIST_TOP + (row - 1 - firstVisible) * Duo40.yAdvance;
+}
+
+// Everything the Open screen shows apart from the selection, to tell when an
+// arrow key only needs the marker moved.
+std::string openContents(const char *status) {
+    std::string c = todayName() + "|" + (status ? status : "") + "|" + std::to_string(firstVisible);
+    if (drafts.empty())
+        c += draftsChecking ? "|checking" : online() ? "|online" : "|offline";
+    for (const DraftInfo &d : drafts)
+        c += "|" + d.name + " " + std::to_string(d.modified);
+    return c;
+}
+
+// Moves the "›" marker from one row to the selected one, in the frame buffer.
+void moveOpenMarker(size_t from) {
+    const int16_t marginX = 64, rowH = Duo40.yAdvance;
+    int32_t y = openRowTop(from);
+    if (y >= 0)
+        display.fillRect(marginX, y, openTitleX() - marginX, rowH, WHITE);
+    y = openRowTop(selected);
+    if (y >= 0)
+        tw::drawText(display, Duo40, marginX, y + Duo40Ascent, "›", 0, strlen("›"));
+}
+
 // The daily note, then a "Drafts" section. Drafts scroll; the daily note stays put.
 // The footer has the key hint on the left and status (syncing) on the right; the
 // hint gives way when both don't fit. Asleep, the status alone is centered.
 void drawOpenScreen(const char *status = nullptr, bool asleep = false) {
-    const int16_t marginX = 64, top = 64, rowH = Duo40.yAdvance;
-    const int16_t labelY = top + rowH + 48;         // section label, after a gap
-    const int16_t listTop = labelY + 60;             // first draft row
-    const int16_t bottom = 720 - 72;
-    const size_t rows = (bottom - listTop) / rowH;
-    if (selected > 0) {
-        size_t i = selected - 1;
-        if (i < firstVisible)
-            firstVisible = i;
-        if (i >= firstVisible + rows)
-            firstVisible = i - rows + 1;
-    }
+    const int16_t marginX = 64, top = OPEN_TOP, rowH = Duo40.yAdvance;
+    const int16_t labelY = OPEN_LABEL_Y, listTop = OPEN_LIST_TOP;
+    const size_t rows = OPEN_ROWS;
+    scrollOpenList();
 
     page.invalidate(); // the writing page has to be redrawn in full next time
     display.clearDisplay();
@@ -1608,13 +1648,39 @@ void loop() {
         return;
 
     if (screen == Screen::Open) {
+        // Moving the selection uses typing's short passes; a changed footer
+        // gets long ones so the old message erases cleanly. The faint trace
+        // short passes leave goes at a full refresh after a minute idle.
+        static std::string footerShown;
+        static bool listPartialsSinceClean = false;
+        if (listPartialsSinceClean && now - lastKeyAt > CLEAN_AFTER_IDLE_MS && now - lastUpdateAt > CLEAN_AFTER_IDLE_MS)
+            forceFull = true;
+        static std::string contentsShown;
+        static size_t selectedShown = 0;
         if (forceFull || openDirty) {
             bool full = forceFull;
-            drawOpenScreen(openNotice.empty() ? nullptr : openNotice.c_str());
+            bool footerChanged = openNotice != footerShown;
+            const char *status = openNotice.empty() ? nullptr : openNotice.c_str();
+            uint32_t t0 = millis();
+            scrollOpenList();
+            std::string contents = openContents(status);
+            bool markerOnly = !full && contents == contentsShown;
+            if (markerOnly)
+                moveOpenMarker(selectedShown); // an arrow key: just the marker
+            else
+                drawOpenScreen(status);
+            contentsShown = contents;
+            selectedShown = selected;
+            uint32_t t1 = millis();
             if (full)
                 display.display();
             else
-                display.quickPartialUpdate(true, FOOTER_PASS_US);
+                display.quickPartialUpdate(true, footerChanged ? FOOTER_PASS_US : PASS_US);
+            Serial.printf("list: %s, draw %lu ms, panel %lu ms, key waited %lu ms\n",
+                          full ? "full refresh" : markerOnly ? "marker" : "partial",
+                          (unsigned long)(t1 - t0), (unsigned long)(millis() - t1), (unsigned long)(millis() - lastKeyAt));
+            footerShown = openNotice;
+            listPartialsSinceClean = !full;
             forceFull = openDirty = false;
             panelOn = !full;
             lastUpdateAt = millis();
