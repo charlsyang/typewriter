@@ -207,7 +207,8 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
 
     // Redraw from the first line that differs from what's on screen (always
     // including the last line, where the cursor is), or everything if the page
-    // moved or something else was drawn.
+    // moved or something else was drawn. The line that was last on screen had the
+    // cursor drawn after it, so it never counts as unchanged.
     std::string footer = std::string(footerLeft ? footerLeft : "") + "\n" + (footerRight ? footerRight : "");
     size_t from = first;
     bool patch = shownValid_ && !turned && top_ == shownTop_;
@@ -215,7 +216,7 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
         from = lines.size() - 1;
         for (size_t k = first; k + 1 < lines.size(); k++) {
             const Line &now = lines[k];
-            bool same = k < shownLines_.size() && shownLines_[k].start == now.start && shownLines_[k].end == now.end &&
+            bool same = k + 1 < shownLines_.size() && shownLines_[k].start == now.start && shownLines_[k].end == now.end &&
                         now.end <= shownText_.size() &&
                         shownText_.compare(now.start, now.end - now.start, text, now.start, now.end - now.start) == 0;
             if (!same) {
