@@ -83,6 +83,15 @@ long size(const char *path) {
     return n;
 }
 
+uint32_t modified(const char *path) {
+    File f = LittleFS.open(path, "r");
+    if (!f)
+        return 0;
+    time_t t = f.getLastWrite();
+    f.close();
+    return t > 0 ? (uint32_t)t : 0;
+}
+
 size_t usedBytes() {
     return LittleFS.usedBytes();
 }

@@ -2,6 +2,7 @@
 // half-written file behind.
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,9 @@ std::vector<std::string> list(const char *dir);
 
 // Size of a file in bytes, or -1 if it doesn't exist.
 long size(const char *path);
+
+// When a file was last written (Unix time), or 0 if unknown.
+uint32_t modified(const char *path);
 
 // Bytes used and total, for the status check.
 size_t usedBytes();

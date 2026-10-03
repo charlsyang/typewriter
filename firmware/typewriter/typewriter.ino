@@ -329,8 +329,9 @@ bool blankNewDraftOpen() {
            !(syncRunning && syncJob.localPath == doc.path);
 }
 
-// What the list shows: drafts started here and not in Dropbox yet first, then
-// Dropbox's drafts, newest first. New drafts left blank are removed on the way.
+// What the list shows: drafts started here and not in Dropbox yet first (dated
+// by their last save), then Dropbox's drafts, newest first. New drafts left
+// blank are removed on the way.
 std::vector<DraftInfo> listDrafts(const std::vector<DraftInfo> &all) {
     std::vector<DraftInfo> list;
     for (const std::string &name : tw::storage::list("/blog")) {
@@ -347,6 +348,9 @@ std::vector<DraftInfo> listDrafts(const std::vector<DraftInfo> &all) {
         DraftInfo d;
         d.name = name;
         d.draft = true;
+        d.modified = tw::storage::modified(path.c_str());
+        if (d.modified < 1700000000) // written before the clock was set
+            d.modified = 0;
         list.push_back(d);
     }
     std::vector<DraftInfo> remote = draftsFrom(all);
@@ -1051,7 +1055,8 @@ void handleSerial(uint32_t now) {
                 for (const char *dir : {"/daily", "/blog"}) {
                     for (const std::string &name : tw::storage::list(dir)) {
                         std::string path = std::string(dir) + "/" + name;
-                        Serial.printf("file: %s (%ld bytes)\n", path.c_str(), tw::storage::size(path.c_str()));
+                        Serial.printf("file: %s (%ld bytes, modified %lu)\n", path.c_str(), tw::storage::size(path.c_str()),
+                                      (unsigned long)tw::storage::modified(path.c_str()));
                     }
                 }
             } else if (line.startsWith("sleep")) { // "sleep <seconds>": sleep now, wake on a timer
