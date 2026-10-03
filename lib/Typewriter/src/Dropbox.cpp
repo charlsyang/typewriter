@@ -79,6 +79,18 @@ NetworkClientSecure &Dropbox::connection(bool content) {
     return *tls;
 }
 
+// One HTTPClient per host, kept for good: its destructor closes the connection
+// it was given, so a fresh one per request undid the keep-alive above and every
+// request paid for a new TLS handshake.
+HTTPClient &Dropbox::httpClient(bool content) {
+    HTTPClient *&http = content ? contentHttp_ : apiHttp_;
+    if (!http) {
+        http = new HTTPClient();
+        http->setReuse(true);
+    }
+    return *http;
+}
+
 std::string Dropbox::tlsError(NetworkClientSecure &tls) {
     char text[96] = "";
     tls.lastError(text, sizeof(text));
@@ -94,8 +106,7 @@ bool Dropbox::ensureToken() {
     int code = -1;
     String response;
     for (int attempt = 0; attempt < 2 && code < 0; attempt++) {
-        HTTPClient http;
-        http.setReuse(true);
+        HTTPClient &http = httpClient(false);
         if (!http.begin(tls, "https://api.dropboxapi.com/oauth2/token"))
             continue;
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
@@ -130,10 +141,11 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
     bool content = strcmp(host, "content.dropboxapi.com") == 0;
     NetworkClientSecure &tls = connection(content);
     String url = String("https://") + host + "/2/" + endpoint;
+    uint32_t started = millis();
+    bool wasOpen = tls.connected();
     int code = -1;
     for (int attempt = 0; attempt < 2 && code < 0; attempt++) {
-        HTTPClient http;
-        http.setReuse(true);
+        HTTPClient &http = httpClient(content);
         if (!http.begin(tls, url))
             continue;
         http.setTimeout(15000);
@@ -167,6 +179,8 @@ Dropbox::Result Dropbox::call(const char *host, const char *endpoint, const std:
             tls.stop(); // a kept-alive connection the server had closed: retry fresh
     }
 
+    Serial.printf("dropbox: %s %d in %lu ms (%s connection)\n", endpoint, code, (unsigned long)(millis() - started),
+                  wasOpen ? "open" : "new");
     if (code == 200 || code == 206) // 206: partial content, for a Range request
         return Result::Ok;
     if (code == 401)

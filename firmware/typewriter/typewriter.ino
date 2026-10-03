@@ -1221,8 +1221,9 @@ void handleSerial(uint32_t now) {
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line == "status") {
-                Serial.printf("status: screen %s, document %s (%u bytes)\n", screen == Screen::Open ? "list" : "writing",
-                              doc.path.c_str(), (unsigned)doc.text.size());
+                Serial.printf("status: screen %s, document %s (%u bytes), heap %u KB free (lowest %u KB)\n",
+                              screen == Screen::Open ? "list" : "writing", doc.path.c_str(), (unsigned)doc.text.size(),
+                              (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getMinFreeHeap() / 1024));
             } else if (line == "ls") {
                 for (const char *dir : {"/daily", "/blog"}) {
                     for (const std::string &name : tw::storage::list(dir)) {

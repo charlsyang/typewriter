@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+class HTTPClient;
+
 namespace tw {
 
 class Dropbox {
@@ -60,6 +62,7 @@ class Dropbox {
 
   private:
     NetworkClientSecure &connection(bool content);
+    HTTPClient &httpClient(bool content);
     static std::string tlsError(NetworkClientSecure &tls);
     bool ensureToken();
     Result call(const char *host, const char *endpoint, const std::string &arg, const std::string *body,
@@ -72,6 +75,8 @@ class Dropbox {
     std::string lastError_;
     NetworkClientSecure *apiTls_ = nullptr;     // api.dropboxapi.com
     NetworkClientSecure *contentTls_ = nullptr; // content.dropboxapi.com
+    HTTPClient *apiHttp_ = nullptr;             // kept too: see httpClient()
+    HTTPClient *contentHttp_ = nullptr;
 };
 
 } // namespace tw
