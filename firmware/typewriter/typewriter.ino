@@ -354,8 +354,13 @@ std::vector<DraftInfo> listDrafts(const std::vector<DraftInfo> &all) {
             d.modified = 0;
         list.push_back(d);
     }
-    std::vector<DraftInfo> remote = draftsFrom(all);
-    list.insert(list.end(), remote.begin(), remote.end());
+    // Dropbox's drafts that have a copy here (one that couldn't be downloaded,
+    // or was just deleted, would open as an empty page).
+    for (const DraftInfo &d : draftsFrom(all)) {
+        std::string path = "/blog/" + d.name;
+        if (path == doc.path || tw::storage::exists(path.c_str()))
+            list.push_back(d);
+    }
     return list;
 }
 
@@ -560,7 +565,10 @@ bool findBacklog(std::string &localPath, std::string &remotePath, const std::vec
 
 void finishDraftsRefresh();
 void moveNewDraft(SyncJob &j);
+void showOpenScreen();
 void relistDrafts();
+std::string essayTitle(const std::string &name);
+void rememberOpenEssay(const std::string &name);
 
 // Cmd+S on the list: syncs the open note, then every other file waiting, then
 // refreshes the list, one after another.
@@ -593,16 +601,34 @@ void finishSync() {
                   (unsigned long)(millis() - j.startedAt), j.state.rev.c_str(), r.message.c_str());
 
     if (r.outcome == tw::SyncResult::Deleted) {
+        bool open = j.localPath == doc.path;
+        if (open && (shortestSinceSnapshot < j.snapshotSize || doc.text.size() != j.snapshotSize)) {
+            // You typed into it while the sync ran: keep all of it. The next sync
+            // puts it back in Dropbox, as with edits made offline.
+            Serial.printf("sync: %s was deleted in Dropbox, but you typed since: keeping it\n", j.localPath.c_str());
+            doc.unsaved = true;
+            return;
+        }
         // Deleted in Dropbox: remove the Inkplate's copy too.
-        tw::storage::remove(j.localPath.c_str());
-        tw::storage::remove((j.localPath + ".sync").c_str());
-        if (j.localPath == doc.path && shortestSinceSnapshot >= j.snapshotSize && doc.text.size() == j.snapshotSize) {
+        removeLocalCopy(j.localPath);
+        if (open && isEssay(doc.path)) {
+            // Back to the list, rather than a blank page that typing would
+            // bring back as a new file.
+            std::string title = essayTitle(doc.name);
+            doc.unsaved = false;
+            rememberOpenEssay("");
+            openToday();
+            showOpenScreen();
+            openNotice = "“" + title + "” was deleted in Dropbox.";
+        } else if (open) {
             doc.text.clear();
             doc.sync = tw::SyncState();
             doc.unsaved = false;
             doc.checkedRemote = true;
             page.reset();
             forceFull = true;
+        } else if (isEssay(j.localPath)) {
+            relistDrafts();
         }
         return;
     }
