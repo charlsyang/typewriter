@@ -107,7 +107,7 @@ int main() {
         db.put(PATH, "Keep this. Delete this. Laptop addition.");
         SyncResult r = syncFile(db, PATH, text, s);
         EXPECT(r.outcome == SyncResult::Conflict);
-        std::string copy = "/OS/Daily Notes/2026-10-01 (Inkplate conflicted copy).md";
+        std::string copy = "/OS/Daily Notes/2026-10-01 (Copy).md";
         EXPECT(db.files[copy] == "Keep this. Replacement.");
         EXPECT(text == "Keep this. Delete this. Laptop addition.");
         EXPECT(db.files[PATH] == text);

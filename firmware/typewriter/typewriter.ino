@@ -74,7 +74,7 @@ const char *DAILY_NOTES = "/OS/Daily Notes/"; // in Dropbox
 const char *ESSAYS = "/Site/blog";            // in Dropbox
 const uint32_t SLEEP_AFTER_IDLE_MS = 10 * 60 * 1000; // deep sleep after this long without typing
 const gpio_num_t WAKE_BUTTON = GPIO_NUM_36;           // the board's WAKE button
-const char *ASLEEP = "Asleep · press WAKE to continue";
+const char *ASLEEP = "In sleep";
 const uint32_t BATTERY_CHECK_EVERY_MS = 60000;
 const int LOW_BATTERY_PERCENT = 15;
 
@@ -674,7 +674,7 @@ void finishSync() {
         tw::saveSyncState(doc.path, doc.sync);
     }
     if (r.outcome == tw::SyncResult::Conflict)
-        notice = "Changed on both sides. Your Inkplate version is in Dropbox as " +
+        notice = "Sync conflict. Saved in Dropbox as " +
                  r.message.substr(r.message.rfind('/') + 1);
     dirty = true;
 }
@@ -884,7 +884,7 @@ void closeOpenScreen() {
 void startSyncAll() {
     save("Cmd+S");
     if (!online()) {
-        openNotice = "Saved offline. Connect to Wi-Fi to sync.";
+        openNotice = "Saved locally. Connect to Wi-Fi to sync.";
         return;
     }
     syncAllActive = true;
@@ -900,7 +900,7 @@ void continueSyncAll() {
     std::string local, remote;
     if (!online()) {
         syncAllActive = false;
-        openNotice = "Saved offline. Connect to Wi-Fi to sync.";
+        openNotice = "Saved locally. Connect to Wi-Fi to sync.";
     } else if (!doc.remotePath.empty() &&
                std::find(syncAllTried.begin(), syncAllTried.end(), doc.path) == syncAllTried.end()) {
         syncAllTried.push_back(doc.path);
@@ -916,7 +916,7 @@ void continueSyncAll() {
         return;
     } else {
         syncAllActive = false;
-        openNotice = syncAllFailed ? "Couldn’t sync everything. Saved on the Inkplate." : "Synced.";
+        openNotice = syncAllFailed ? "Partially synced. Saved locally." : "Synced";
     }
     if (screen == Screen::Open)
         openDirty = true;
@@ -1062,9 +1062,9 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
             if (blankNewDraftOpen())
                 notice = "Nothing to save yet.";
             else if (doc.remotePath.empty())
-                notice = "Saved on the Inkplate. Undated notes don't sync.";
+                notice = "Unable to sync undated note. Saved locally.";
             else if (!online())
-                notice = "Saved on the Inkplate. It will sync when Wi-Fi is back.";
+                notice = "Saved locally. Connect to Wi-Fi to sync.";
             else
                 startSync("Cmd+S");
             markChanged(now);
@@ -1259,19 +1259,19 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
     right[0] = 0;
     tw::Keyboard::State kb = keyboard.state();
     if (doc.saveFailed) {
-        snprintf(out, size, "Not saved: couldn’t write to flash. Cmd+S to retry.");
+        snprintf(out, size, "Failed to save. Cmd+S to retry.");
     } else if (!notice.empty()) {
         snprintf(out, size, "%s", notice.c_str());
     } else if (!doc.checkedRemote && doc.text.empty() && online() && !doc.remotePath.empty()) {
         snprintf(out, size, "Downloading %s…", doc.name.c_str());
     } else if (doc.syncFailures >= SYNC_FAILURES_BEFORE_NOTICE) {
-        snprintf(out, size, "Can’t sync with Dropbox (%s). Saved on the Inkplate.", doc.syncError.c_str());
+        snprintf(out, size, "Failed to sync. Saved locally."); // the reason is in the serial log
     } else if (kb == tw::Keyboard::State::Searching || kb == tw::Keyboard::State::Connecting) {
         snprintf(out, size, "Keyboard not connected. Press a key on it to wake it.");
     } else if (!tw::wallclock::isSet()) {
-        snprintf(out, size, "Clock not set, so this is undated.md. Run tools/settime.py over USB.");
+        snprintf(out, size, "Clock unset. Connect to USB or Wi-Fi.");
     } else if (batteryPercent >= 0 && batteryPercent <= LOW_BATTERY_PERCENT) {
-        snprintf(out, size, "Battery low: %d%%", batteryPercent);
+        snprintf(out, size, "Low battery: %d%%", batteryPercent);
     } else if (showStatus) {
         char battery[24] = "USB power";
         if (batteryPercent >= 0)
@@ -1279,11 +1279,11 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
         int words = wordCount();
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
         const char *state = doc.unsaved                              ? "Not saved yet"
-                            : doc.remotePath.empty()                 ? "Saved"
+                            : doc.remotePath.empty()                 ? "Saved locally, note is undated"
                             : syncRunning                            ? "Syncing…"
                             : !tw::hasLocalChanges(doc.text, doc.sync) && doc.checkedRemote ? "Synced"
                             : online()                               ? "Saved, not synced yet"
-                                                                     : "Saved, offline";
+                                                                     : "Saved locally";
         snprintf(right, rightSize, "%s · %s", state, battery);
     }
 }
@@ -1387,7 +1387,7 @@ void drawOpenScreen(const char *status = nullptr, bool asleep = false) {
     const char *label = "Drafts";
     tw::drawText(display, Duo28, openTitleX(), labelY + Duo28Ascent, label, 0, strlen(label));
     if (drafts.empty()) {
-        const char *none = draftsChecking ? "Checking Dropbox…" : online() ? "No drafts in /Site/blog." : "No drafts yet. Connect to Wi-Fi to check.";
+        const char *none = draftsChecking ? "Checking Dropbox…" : online() ? "No drafts found" : "No drafts yet. Connect to Wi-Fi to check.";
         tw::drawText(display, Duo28, openTitleX(), listTop + Duo28Ascent, none, 0, strlen(none));
     }
     for (size_t i = firstVisible; i < drafts.size() && i < firstVisible + rows; i++)

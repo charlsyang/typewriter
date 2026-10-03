@@ -10,13 +10,13 @@ std::string statePath(const std::string &localPath) {
     return localPath + ".sync";
 }
 
-// "<folder>/<name> (Inkplate conflicted copy).<ext>"
+// "<folder>/<name> (Copy).<ext>"
 std::string conflictPath(const std::string &path) {
     size_t slash = path.rfind('/');
     size_t dot = path.rfind('.');
     if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
         dot = path.size();
-    return path.substr(0, dot) + " (Inkplate conflicted copy)" + path.substr(dot);
+    return path.substr(0, dot) + " (Copy)" + path.substr(dot);
 }
 
 bool endsWith(const std::string &s, const std::string &suffix) {
