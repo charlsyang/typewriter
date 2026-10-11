@@ -261,5 +261,33 @@ Layout fit(const std::string &text, const std::vector<Size> &sizes, const std::f
     return layout;
 }
 
+size_t pickIndex(size_t count, const std::function<bool(size_t)> &isFavorite,
+                 const std::function<uint32_t()> &random) {
+    if (count == 0)
+        return 0;
+    while (true) {
+        size_t i = random() % count;
+        if (isFavorite(i) || random() % 3 != 0)
+            return i;
+    }
+}
+
+bool Recent::contains(uint32_t id) const {
+    for (size_t k = 0; k < count && k < CAPACITY; k++) {
+        if (ids[k] == id)
+            return true;
+    }
+    return false;
+}
+
+void Recent::add(uint32_t id) {
+    if (count < CAPACITY) {
+        ids[count++] = id;
+        return;
+    }
+    ids[next] = id;
+    next = (next + 1) % CAPACITY;
+}
+
 } // namespace highlight
 } // namespace tw

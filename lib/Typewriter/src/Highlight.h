@@ -52,5 +52,24 @@ struct Layout {
 Layout fit(const std::string &text, const std::vector<Size> &sizes, const std::function<size_t(size_t)> &maxLines,
            int32_t maxWidth);
 
+// Picking which highlight to show: mostly at random, with favorites 1.5 times
+// as likely. Draws an index uniformly; a favorite is always kept, any other
+// with probability 2/3 (else it draws again). random() returns uniform 32-bit values.
+size_t pickIndex(size_t count, const std::function<bool(size_t)> &isFavorite,
+                 const std::function<uint32_t()> &random);
+
+// The last few highlights shown, by Readwise ID, so they don't come straight
+// back. Plain data, so it can live in RTC memory through deep sleep.
+struct Recent {
+    static const size_t CAPACITY = 32;
+    uint32_t ids[CAPACITY];
+    uint8_t count; // how many of ids are in use
+    uint8_t next;  // where the next one goes once full
+
+    bool contains(uint32_t id) const;
+    void add(uint32_t id);
+    void clear() { count = next = 0; }
+};
+
 } // namespace highlight
 } // namespace tw

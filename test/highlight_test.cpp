@@ -101,6 +101,36 @@ int main() {
     l = fit("aaa bbb ccc ddd eee fff", sizes, room, 100);
     EXPECT(!l.fits);
 
+    // pickIndex: favorites come out 1.5x as often as the others, per highlight
+    {
+        uint32_t state = 12345; // xorshift: deterministic
+        auto rng = [&]() { state ^= state << 13; state ^= state >> 17; state ^= state << 5; return state; };
+        auto fav = [](size_t i) { return i % 4 == 0; }; // a quarter are favorites
+        size_t favPicks = 0, otherPicks = 0;
+        for (int k = 0; k < 200000; k++)
+            (fav(pickIndex(1000, fav, rng)) ? favPicks : otherPicks)++;
+        double ratio = (favPicks / 250.0) / (otherPicks / 750.0); // per-highlight rate
+        EXPECT(ratio > 1.45 && ratio < 1.55);
+        EXPECT(pickIndex(0, fav, rng) == 0);
+        EXPECT(pickIndex(1, fav, rng) == 0);
+    }
+
+    // Recent: remembers the last 32, forgets the oldest
+    {
+        Recent r;
+        r.clear();
+        EXPECT(!r.contains(7));
+        r.add(7);
+        EXPECT(r.contains(7));
+        for (uint32_t id = 100; id < 100 + Recent::CAPACITY - 1; id++)
+            r.add(id);
+        EXPECT(r.contains(7)); // 32 in, still there
+        r.add(999);
+        EXPECT(!r.contains(7) && r.contains(999) && r.contains(100));
+        r.add(1000);
+        EXPECT(!r.contains(100) && r.contains(101));
+    }
+
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }
