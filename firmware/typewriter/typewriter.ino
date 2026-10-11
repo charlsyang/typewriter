@@ -27,7 +27,7 @@
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
 // forgets the keyboard, Ctrl+O/D/N/S/Z act as Cmd, Ctrl+R runs a command (status,
-// ls, sd, put, rm, sleep; tools/sd_put.py copies files onto the SD card), other
+// ls, sd, put, hl, rm, sleep; tools/sd_put.py copies files onto the SD card), other
 // bytes type text. Serial logs events and timings.
 
 #include "secrets.h"
@@ -1296,6 +1296,59 @@ void receiveFile(const String &line, uint32_t now) {
     lastKeyAt = now;
 }
 
+// ---- Readwise highlights on the SD card (tools/readwise_seed.py) ----
+
+// Number of highlights in index.bin (0 without a card or files).
+uint32_t highlightCount() {
+    if (!mountSd())
+        return 0;
+    FsFile f = display.getSdFat().open("/highlights/index.bin", O_RDONLY);
+    uint32_t count = f ? f.size() / 8 : 0;
+    f.close();
+    return count;
+}
+
+// Reads highlight number index: its JSON line from highlights.jsonl, and whether
+// it's a favorite.
+bool readHighlight(uint32_t index, String &line, bool &favorite) {
+    SdFat &sd = display.getSdFat();
+    FsFile f = sd.open("/highlights/index.bin", O_RDONLY);
+    uint8_t entry[8] = {};
+    bool ok = f && f.seekSet((uint64_t)index * 8) && f.read(entry, 8) == 8;
+    f.close();
+    if (!ok)
+        return false;
+    favorite = entry[4];
+    uint32_t offset = entry[0] | entry[1] << 8 | entry[2] << 16 | (uint32_t)entry[3] << 24;
+    f = sd.open("/highlights/highlights.jsonl", O_RDONLY);
+    line = "";
+    if (f && f.seekSet(offset)) {
+        int c;
+        while ((c = f.read()) >= 0 && c != '\n')
+            line += (char)c;
+    }
+    f.close();
+    return line.length() > 0;
+}
+
+// Ctrl+R "hl": checks the files and prints the count and one highlight at random.
+void printRandomHighlight() {
+    uint32_t count = highlightCount();
+    char state[160] = {};
+    if (count) {
+        FsFile f = display.getSdFat().open("/highlights/state.json", O_RDONLY);
+        if (f)
+            f.read(state, sizeof state - 1);
+        f.close();
+    }
+    Serial.printf("hl: state %s; index has %lu\n", state[0] ? state : "(missing)", (unsigned long)count);
+    String line;
+    bool favorite = false;
+    uint32_t pick = count ? esp_random() % count : 0;
+    if (count && readHighlight(pick, line, favorite))
+        Serial.printf("hl: #%lu%s %s\n", (unsigned long)pick, favorite ? " (favorite)" : "", line.c_str());
+}
+
 // Ctrl+T over USB: "<utc epoch> <posix tz>\n" sets the clock (tools/settime.py).
 // Any other byte types text, like tools/type.py.
 void handleSerial(uint32_t now) {
@@ -1339,7 +1392,7 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "rm <path>" or "sleep [seconds]"
+        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "rm <path>" or "sleep [seconds]"
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line == "status") {
@@ -1377,6 +1430,8 @@ void handleSerial(uint32_t now) {
                 }
             } else if (line.startsWith("put ")) {
                 receiveFile(line, now);
+            } else if (line == "hl") {
+                printRandomHighlight();
             } else if (line.startsWith("sleep")) { // "sleep <seconds>": sleep now, wake on a timer
                 goToSleep(line.length() > 6 ? line.substring(6).toInt() : 0);
             } else if (line.startsWith("rm ")) {

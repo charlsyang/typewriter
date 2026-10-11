@@ -7,3 +7,6 @@
 
 #define DROPBOX_APP_KEY ""
 #define DROPBOX_REFRESH_TOKEN ""
+
+// Readwise access token, from readwise.io/access_token
+#define READWISE_TOKEN ""
