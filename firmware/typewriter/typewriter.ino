@@ -1468,6 +1468,107 @@ int drawHighlight(tw::GrayCanvas &canvas, const std::string &raw, const std::str
     return px;
 }
 
+// Whether a highlight's text fits the sleep screen at one of HL_SIZES.
+bool highlightFits(const std::string &raw) {
+    std::string text = tw::highlight::clean(raw, libronHasGlyph);
+    std::vector<tw::highlight::Size> sizes;
+    for (int px : HL_SIZES)
+        sizes.push_back(highlightSize(px));
+    return tw::highlight::fit(text, sizes, [](size_t k) { return highlightRoom(HL_SIZES[k]); },
+                              display.width() - 2 * HL_PAD)
+        .fits;
+}
+
+// The highlights shown last, kept through deep sleep so they don't come straight back.
+RTC_DATA_ATTR tw::highlight::Recent recentHighlights;
+
+struct PickedHighlight {
+    uint32_t index = 0, id = 0;
+    bool favorite = false;
+    std::string text, title, author;
+};
+
+struct PickStats {
+    int draws = 0, recent = 0, tooLong = 0;
+};
+
+// Picks the highlight to show: at random with favorites 1.5x as likely
+// (tw::highlight::pickIndex), passing over ones in recent and ones that don't
+// fit. False if there's no card or files, or nothing turned up in 50 draws.
+bool pickHighlight(PickedHighlight &out, const tw::highlight::Recent &recent, PickStats *stats = nullptr) {
+    uint32_t count = highlightCount();
+    if (!count)
+        return false;
+    FsFile index = display.getSdFat().open("/highlights/index.bin", O_RDONLY);
+    auto isFavorite = [&](size_t i) {
+        uint8_t entry[8] = {};
+        return index.seekSet((uint64_t)i * 8) && index.read(entry, 8) == 8 && entry[4];
+    };
+    for (int draw = 0; draw < 50; draw++) {
+        size_t i = tw::highlight::pickIndex(count, isFavorite, [] { return esp_random(); });
+        if (stats)
+            stats->draws++;
+        String line;
+        bool favorite = false;
+        JsonDocument json;
+        if (!readHighlight(i, line, favorite) || deserializeJson(json, line))
+            continue;
+        uint32_t id = json["id"] | 0u;
+        if (recent.contains(id)) {
+            if (stats)
+                stats->recent++;
+            continue;
+        }
+        std::string text = json["text"] | "";
+        if (!highlightFits(text)) {
+            if (stats)
+                stats->tooLong++;
+            continue;
+        }
+        out.index = i;
+        out.id = id;
+        out.favorite = favorite;
+        out.text = text;
+        out.title = json["title"] | "";
+        out.author = json["author"] | "";
+        index.close();
+        return true;
+    }
+    index.close();
+    return false;
+}
+
+// Ctrl+R "hlpick [n]": picks n highlights as the sleep screen will (remembering
+// each in a recent list of its own, not the real one) and reports how it went.
+void testPicks(int n) {
+    tw::highlight::Recent recent;
+    recent.clear();
+    PickStats stats;
+    int picked = 0, favorites = 0, repeats = 0;
+    std::vector<uint32_t> seen;
+    uint32_t t0 = millis(), slowest = 0;
+    for (int k = 0; k < n; k++) {
+        uint32_t t = millis();
+        PickedHighlight h;
+        if (!pickHighlight(h, recent, &stats))
+            break;
+        slowest = std::max(slowest, millis() - t);
+        picked++;
+        favorites += h.favorite;
+        if (std::find(seen.begin(), seen.end(), h.id) != seen.end())
+            repeats++;
+        seen.push_back(h.id);
+        recent.add(h.id);
+        if (k < 3)
+            Serial.printf("hlpick: #%lu%s %.70s\n", (unsigned long)h.index, h.favorite ? " (favorite)" : "", h.text.c_str());
+    }
+    uint32_t ms = millis() - t0;
+    Serial.printf("hlpick: %d picked in %lu ms (%lu ms each, slowest %lu ms); %d draws, passed over %d recent and %d "
+                  "too long; favorites %d%%; %d repeats of earlier picks (none within 32)\n",
+                  picked, (unsigned long)ms, picked ? (unsigned long)(ms / picked) : 0, (unsigned long)slowest,
+                  stats.draws, stats.recent, stats.tooLong, picked ? favorites * 100 / picked : 0, repeats);
+}
+
 // Ctrl+R "hltest [size|0] [index]": a highlight as on the sleep screen, in 3-bit
 // with Libron: number index from the card, or the mockup's text without one.
 // Size 0 picks the largest that fits. Any key puts back the screen that was there.
@@ -1587,7 +1688,7 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "hltest [size] [index]",
+        // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "hlpick [n]", "hltest [size] [index]",
         // "hltour <size>:<index> ...", "rm <path>" or "sleep [seconds]"
         if (b == 0x12) {
             String line = Serial.readStringUntil('\n');
@@ -1629,6 +1730,8 @@ void handleSerial(uint32_t now) {
                 receiveFile(line, now);
             } else if (line == "hl") {
                 printRandomHighlight();
+            } else if (line.startsWith("hlpick")) {
+                testPicks(line.length() > 7 ? line.substring(7).toInt() : 100);
             } else if (line.startsWith("hltour ")) {
                 startTour(line);
             } else if (line.startsWith("hltest")) {
