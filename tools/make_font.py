@@ -12,7 +12,16 @@ The header also emits a lookup table so the firmware can map UTF-8 code points
 to these bytes.
 
 Usage: tools/.venv/bin/python tools/make_font.py NAME SIZE [--weight W] [--cutoff C]
-Example: tools/make_font.py Duo40 40 --weight 400 --cutoff 64
+                                                [--line-spacing S] [--layout raqm|basic]
+
+Output depends on the Pillow build, not only on the arguments: the layout engine
+rounds advances differently (Duo40 '!' is 23 px with basic, 24 px with raqm), and
+FreeType 2.13 and 2.14 rasterize the composed accents (Ç Ã Ñ Õ ç ã ñ õ) a pixel apart.
+The committed headers were made with:
+  Duo40  Pillow 11.3.0 (FreeType 2.13.3)  make_font.py Duo40 40 --weight 400 --cutoff 64 --layout basic
+  Duo24  Pillow 11.3.0 (FreeType 2.13.3)  make_font.py Duo24 24 --weight 400 --cutoff 64 --line-spacing 1.2 --layout basic
+  Duo28  Pillow 12.3.0 (FreeType 2.14.3)  make_font.py Duo28 28 --weight 400 --cutoff 64 --line-spacing 1.2
+tools/.venv has Pillow 12.3.0. For Duo40 or Duo24, use a venv with pillow==11.3.0.
 """
 import argparse
 import os
@@ -43,8 +52,11 @@ def byte_map():
     return slots
 
 
-def load_font(size, weight):
-    font = ImageFont.truetype(FONT_FILE, size)
+LAYOUTS = {"raqm": ImageFont.Layout.RAQM, "basic": ImageFont.Layout.BASIC}
+
+
+def load_font(size, weight, layout):
+    font = ImageFont.truetype(FONT_FILE, size, layout_engine=LAYOUTS[layout])
     axes = font.get_variation_axes()
     font.set_variation_by_axes([weight if a["name"] == b"Weight" else a["default"] for a in axes])
     return font
@@ -81,9 +93,10 @@ def main():
     ap.add_argument("--weight", type=int, default=400)
     ap.add_argument("--cutoff", type=int, default=128)
     ap.add_argument("--line-spacing", type=float, default=1.5)
+    ap.add_argument("--layout", choices=LAYOUTS, default="raqm")
     args = ap.parse_args()
 
-    font = load_font(args.size, args.weight)
+    font = load_font(args.size, args.weight, args.layout)
     bitmap = bytearray()
     glyphs = []
     missing = []
