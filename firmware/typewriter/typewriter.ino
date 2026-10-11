@@ -34,6 +34,8 @@
 
 #include <Clock.h>
 #include <Dropbox.h>
+#include <GrayCanvas.h>
+#include <Highlight.h>
 #include <FastInkplate.h>
 #include <History.h>
 #include <Keyboard.h>
@@ -41,6 +43,7 @@
 #include <Storage.h>
 #include <Sync.h>
 #include <Text.h>
+#include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <algorithm>
@@ -48,6 +51,11 @@
 #include <fonts/Duo24.h>
 #include <fonts/Duo28.h>
 #include <fonts/Duo40.h>
+#include <fonts/Libron28.h>
+#include <fonts/Libron36.h>
+#include <fonts/Libron44.h>
+#include <fonts/Libron52.h>
+#include <fonts/LibronItalic28.h>
 
 tw::FastInkplate display(INKPLATE_1BIT);
 tw::Page page(display, Duo40, Duo40Ascent, Duo24, Duo24Ascent);
@@ -136,6 +144,10 @@ bool showStatus = false; // Cmd+I: status line until the next key
 bool panelOn = false;
 bool partialsSinceClean = false;
 bool showingPairing = false;
+bool grayTestShown = false; // Ctrl+R hltest: until the next key
+std::vector<std::pair<int, int32_t>> tour; // Ctrl+R hltour: (size, highlight) stops
+size_t tourPos = 0;
+void showTourStop();
 uint32_t lastUpdateAt = 0;
 uint32_t firstUnshownKeyAt = 0;
 uint32_t seenKeyboardRevision = UINT32_MAX;
@@ -1102,6 +1114,22 @@ bool handleReadingKey(const tw::KeyEvent &e) {
 
 void handleKey(const tw::KeyEvent &e, uint32_t now) {
     lastKeyAt = now;
+    if (grayTestShown) { // a tour steps with the arrows; any other key puts back the screen
+        bool fwd = e.type == tw::KeyEvent::Right || e.type == tw::KeyEvent::Down;
+        bool back = e.type == tw::KeyEvent::Left || e.type == tw::KeyEvent::Up;
+        if (!tour.empty() && (fwd || back)) {
+            if (fwd && tourPos + 1 < tour.size())
+                tourPos++;
+            else if (back && tourPos > 0)
+                tourPos--;
+            showTourStop();
+            return;
+        }
+        tour.clear();
+        grayTestShown = false;
+        forceFull = true;
+        return;
+    }
     if (screen == Screen::Open) {
         handleOpenKey(e);
         return;
@@ -1349,6 +1377,173 @@ void printRandomHighlight() {
         Serial.printf("hl: #%lu%s %s\n", (unsigned long)pick, favorite ? " (favorite)" : "", line.c_str());
 }
 
+// Libron at a size: the quote's sizes, and 28 for title and author.
+const tw::GrayFont &libron(int size) {
+    switch (size) {
+    case 28: return Libron28; // title and author
+    case 36: return Libron36;
+    case 44: return Libron44;
+    default: return Libron52;
+    }
+}
+
+// The sleep screen's highlight: the same padding on all four sides, measured
+// from the quote's cap height at the top to the author's descenders at the
+// bottom. "In sleep" sits centered in the bottom padding, as on the list.
+const int32_t HL_PAD = 80;
+const int32_t HL_TITLE_GAP = 30;   // from the last quote line's line box to the title's baseline
+const int32_t HL_AUTHOR_GAP = 40;  // title baseline to author baseline
+const int HL_SIZES[] = {52, 44, 36}; // largest first; 36 is the floor (smaller is too small to read)
+
+int32_t capHeight(const tw::GrayFont &f) { return -f.glyph['H' - f.first].yOffset; }
+int32_t descender(const tw::GrayFont &f) {
+    const tw::GrayGlyph &g = f.glyph['p' - f.first];
+    return g.height + g.yOffset;
+}
+
+bool libronHasGlyph(uint32_t cp) {
+    uint8_t b = tw::fontByte(cp);
+    return (b != '?' || cp == '?') && Libron28.glyph[b - Libron28.first].xAdvance16 > 0;
+}
+
+tw::highlight::Size highlightSize(int px) {
+    const tw::GrayFont *f = &libron(px);
+    return {px, f->yAdvance,
+            [f](const std::string &s, size_t a, size_t b) { return tw::measure16(*f, s.c_str(), a, b); }};
+}
+
+// Lines of the quote that fit at a size, leaving room for title and author.
+size_t highlightRoom(int px) {
+    const tw::GrayFont &f = libron(px);
+    int32_t bottom = display.height() - HL_PAD - descender(Libron28);
+    int32_t firstBaseline = HL_PAD + capHeight(f);
+    // n lines put the title at firstBaseline + n * yAdvance + HL_TITLE_GAP.
+    size_t n = 0;
+    while (firstBaseline + (int32_t)(n + 1) * f.yAdvance + HL_TITLE_GAP + HL_AUTHOR_GAP <= bottom)
+        n++;
+    return n;
+}
+
+// One line of attribution, cut with … if it's too wide.
+void drawAttribution(tw::GrayCanvas &canvas, const tw::GrayFont &f, int px, int32_t y, const std::string &raw) {
+    std::string text = tw::highlight::clean(raw, libronHasGlyph);
+    tw::highlight::Size size = {px, f.yAdvance,
+                                [&f](const std::string &s, size_t a, size_t b) { return tw::measure16(f, s.c_str(), a, b); }};
+    int32_t width = display.width() - 2 * HL_PAD;
+    auto lines = tw::highlight::wrap(text, size, width);
+    tw::highlight::truncate(lines, 1, size, width);
+    if (!lines.empty())
+        tw::drawText(canvas, f, HL_PAD, y, lines[0].c_str(), 0, lines[0].size());
+}
+
+// Draws a highlight onto the canvas at the largest of HL_SIZES that fits (or
+// at forcePx, if > 0). Returns the size used, or 0, drawing nothing, if it
+// doesn't fit: such highlights aren't shown.
+int drawHighlight(tw::GrayCanvas &canvas, const std::string &raw, const std::string &title, const std::string &author,
+                  int forcePx, size_t *lineCount = nullptr, std::vector<std::string> *linesOut = nullptr) {
+    std::string text = tw::highlight::clean(raw, libronHasGlyph);
+    std::vector<int> pxs = forcePx > 0 ? std::vector<int>{forcePx} : std::vector<int>(std::begin(HL_SIZES), std::end(HL_SIZES));
+    std::vector<tw::highlight::Size> sizes;
+    for (int px : pxs)
+        sizes.push_back(highlightSize(px));
+    int32_t width = display.width() - 2 * HL_PAD;
+    tw::highlight::Layout layout =
+        tw::highlight::fit(text, sizes, [&](size_t k) { return highlightRoom(pxs[k]); }, width);
+    if (lineCount)
+        *lineCount = layout.lines.size();
+    if (linesOut)
+        *linesOut = layout.lines;
+    if (!layout.fits)
+        return 0;
+    int px = pxs[layout.sizeIndex];
+    const tw::GrayFont &f = libron(px);
+    int32_t y = HL_PAD + capHeight(f);
+    for (const std::string &line : layout.lines) {
+        tw::drawText(canvas, f, HL_PAD, y, line.c_str(), 0, line.size());
+        y += f.yAdvance;
+    }
+    y += HL_TITLE_GAP; // y is the next line's baseline; the title sits HL_TITLE_GAP below it
+    drawAttribution(canvas, LibronItalic28, 28, y, title);
+    drawAttribution(canvas, Libron28, 28, y + HL_AUTHOR_GAP, author);
+    return px;
+}
+
+// Ctrl+R "hltest [size|0] [index]": a highlight as on the sleep screen, in 3-bit
+// with Libron: number index from the card, or the mockup's text without one.
+// Size 0 picks the largest that fits. Any key puts back the screen that was there.
+void showGrayTest(int size, int32_t index, const char *label = nullptr) {
+    std::string text = "System design problems are dominated by concrete specifics, not generic principles.";
+    std::string title = "LLMs Reward Expertise", author = "seangoedecke.com";
+    if (index >= 0) {
+        String line;
+        bool favorite;
+        JsonDocument json;
+        if (index >= (int32_t)highlightCount() || !readHighlight(index, line, favorite) ||
+            deserializeJson(json, line)) {
+            Serial.printf("hltest: no highlight %ld\n", (long)index);
+            return;
+        }
+        text = json["text"] | "";
+        title = json["title"] | "";
+        author = json["author"] | "";
+    }
+    tw::GrayCanvas canvas(display.width(), display.height());
+    if (!canvas.begin()) {
+        Serial.println("hltest: out of memory");
+        return;
+    }
+    uint32_t t0 = millis();
+    size_t lines = 0;
+    std::vector<std::string> drawn;
+    int px = drawHighlight(canvas, text, title, author, size, &lines, &drawn);
+    if (!px) {
+        Serial.printf("hltest: highlight %ld doesn't fit (%u lines at %dpx): it won't be shown\n", (long)index,
+                      (unsigned)lines, size > 0 ? size : HL_SIZES[std::size(HL_SIZES) - 1]);
+        return;
+    }
+    const char *asleep = ASLEEP;
+    int32_t w = tw::measure(Duo24, asleep, 0, strlen(asleep));
+    tw::drawText(canvas, Duo24, (display.width() - w) / 2, 720 - 44 + Duo24Ascent, asleep, 0, strlen(asleep));
+    if (label)
+        tw::drawText(canvas, Duo24, 64, 720 - 44 + Duo24Ascent, label, 0, strlen(label));
+    uint32_t t1 = millis();
+    canvas.show(display);
+    Serial.printf("hltest: %dpx, %u of %u lines, highlight %ld, draw %lu ms, panel %lu ms\n", px, (unsigned)lines,
+                  (unsigned)highlightRoom(px), (long)index, (unsigned long)(t1 - t0), (unsigned long)(millis() - t1));
+    for (const std::string &l : drawn)
+        Serial.printf("hltest: | %s\n", l.c_str());
+    display.selectDisplayMode(INKPLATE_1BIT);
+    page.invalidate();
+    grayTestShown = true;
+}
+
+// Ctrl+R "hltour <size>:<index> ...": shows each stop with hltest, labeled; the
+// arrow keys step through them and any other key ends the tour.
+void showTourStop() {
+    char label[48], size[8];
+    snprintf(size, sizeof size, tour[tourPos].first ? "%dpx" : "fitted", tour[tourPos].first);
+    snprintf(label, sizeof label, "%s \xC2\xB7 %u of %u \xC2\xB7 \xE2\x86\x90\xE2\x86\x92", size, (unsigned)(tourPos + 1),
+             (unsigned)tour.size());
+    showGrayTest(tour[tourPos].first, tour[tourPos].second, label);
+}
+
+void startTour(const String &line) {
+    tour.clear();
+    tourPos = 0;
+    int from = line.indexOf(' ');
+    while (from >= 0) {
+        int to = line.indexOf(' ', from + 1);
+        String stop = line.substring(from + 1, to < 0 ? line.length() : to);
+        int size = 0;
+        long index = -1;
+        if (sscanf(stop.c_str(), "%d:%ld", &size, &index) == 2)
+            tour.push_back({size, (int32_t)index});
+        from = to;
+    }
+    if (!tour.empty())
+        showTourStop();
+}
+
 // Ctrl+T over USB: "<utc epoch> <posix tz>\n" sets the clock (tools/settime.py).
 // Any other byte types text, like tools/type.py.
 void handleSerial(uint32_t now) {
@@ -1392,7 +1587,9 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "rm <path>" or "sleep [seconds]"
+        // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "hltest [size] [index]",
+        // "hltour <size>:<index> ...", "rm <path>" or "sleep [seconds]"
+        if (b == 0x12) {
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line == "status") {
@@ -1432,6 +1629,12 @@ void handleSerial(uint32_t now) {
                 receiveFile(line, now);
             } else if (line == "hl") {
                 printRandomHighlight();
+            } else if (line.startsWith("hltour ")) {
+                startTour(line);
+            } else if (line.startsWith("hltest")) {
+                int size = 52, index = -1;
+                sscanf(line.c_str(), "hltest %d %d", &size, &index);
+                showGrayTest(size, index);
             } else if (line.startsWith("sleep")) { // "sleep <seconds>": sleep now, wake on a timer
                 goToSleep(line.length() > 6 ? line.substring(6).toInt() : 0);
             } else if (line.startsWith("rm ")) {
