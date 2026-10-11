@@ -52,3 +52,16 @@ tools/.venv/bin/python tools/make_font.py Duo24 24 --weight 400 --cutoff 64 --li
 ```
 
 `tools/preview_fonts.py` renders the writing screen at 1280×720 for comparing options.
+
+The sleep screen's highlights use Libron (v0.31, SIL OFL, `fonts/Libron-*.ttf`), kept
+anti-aliased for the panel's 3-bit mode, with its kerning and ligatures (`uharfbuzz` in the
+venv):
+
+```bash
+cd tools
+../tools/.venv/bin/python make_gray_font.py Libron52 52 ../fonts/Libron-Regular.ttf
+../tools/.venv/bin/python make_gray_font.py Libron44 44 ../fonts/Libron-Regular.ttf
+../tools/.venv/bin/python make_gray_font.py Libron36 36 ../fonts/Libron-Regular.ttf
+../tools/.venv/bin/python make_gray_font.py Libron28 28 ../fonts/Libron-Regular.ttf
+../tools/.venv/bin/python make_gray_font.py LibronItalic28 28 ../fonts/Libron-Italic.ttf
+```
