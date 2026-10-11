@@ -26,8 +26,9 @@
 // Ctrl works in place of Cmd.
 //
 // Over USB (tools/settime.py, tools/type.py): Ctrl+T sets the clock, Ctrl+K
-// forgets the keyboard, Ctrl+O/D/N/S/Z act as Cmd, other bytes type text. Serial
-// logs events and timings.
+// forgets the keyboard, Ctrl+O/D/N/S/Z act as Cmd, Ctrl+R runs a command (status,
+// ls, sd, put, rm, sleep; tools/sd_put.py copies files onto the SD card), other
+// bytes type text. Serial logs events and timings.
 
 #include "secrets.h"
 
@@ -1174,6 +1175,127 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
     markChanged(now);
 }
 
+// ---- SD card ----
+
+// The card stays mounted while awake and is powered down only for deep sleep:
+// once sdCardSleep() has run, sdCardInit() can't mount it again until a restart
+// (the library's SPI setup is skipped the second time, leaving the pins off).
+bool sdMounted = false;
+bool mountSd() {
+    if (!sdMounted)
+        sdMounted = display.sdCardInit();
+    return sdMounted;
+}
+
+// ---- Files over USB, onto the SD card ----
+
+const size_t PUT_CHUNK = 4096;          // bytes per acknowledged chunk
+const uint32_t PUT_TIMEOUT_MS = 5000;   // give up when the Mac goes quiet this long mid-chunk
+
+// CRC-32 as zlib computes it (Python's zlib.crc32), so the Mac can check the copy.
+uint32_t crc32Update(uint32_t crc, const uint8_t *data, size_t len) {
+    crc = ~crc;
+    while (len--) {
+        crc ^= *data++;
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
+    }
+    return ~crc;
+}
+
+// After a failed transfer, throws away whatever the Mac was still sending, so
+// none of it is typed into the open note.
+void drainSerial() {
+    uint32_t quietSince = millis();
+    while (millis() - quietSince < 500) {
+        if (Serial.available()) {
+            Serial.read();
+            quietSince = millis();
+        }
+    }
+}
+
+// Ctrl+R "put <path> <bytes> <crc32 hex>" (tools/sd_put.py): receives a file
+// in PUT_CHUNK pieces, each acknowledged with "put: ok <total>", into
+// <path>.tmp on the SD card. Only when every byte arrived and the CRC matches
+// does it replace <path>, so a cut-off transfer leaves the old file alone.
+void receiveFile(const String &line, uint32_t now) {
+    char path[128];
+    unsigned long size = 0, expectCrc = 0;
+    if (sscanf(line.c_str(), "put %127s %lu %lx", path, &size, &expectCrc) != 3 || path[0] != '/') {
+        Serial.println("put: FAILED usage: put <path> <bytes> <crc32 hex>");
+        return;
+    }
+    if (!mountSd()) {
+        Serial.println("put: FAILED no SD card");
+        return;
+    }
+    SdFat &sd = display.getSdFat();
+    String tmp = String(path) + ".tmp";
+    String dir = String(path).substring(0, String(path).lastIndexOf('/'));
+    if (dir.length())
+        sd.mkdir(dir.c_str(), true);
+    FsFile f = sd.open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+    if (!f) {
+        Serial.printf("put: FAILED can't create %s\n", tmp.c_str());
+        sdMounted = false; // the card may have been taken out: mount again next time
+        return;
+    }
+    uint32_t t0 = millis(), crc = 0;
+    uint8_t *buf = (uint8_t *)ps_malloc(PUT_CHUNK); // PSRAM: internal RAM is short with both radios on
+    if (!buf) {
+        f.close();
+        Serial.println("put: FAILED out of memory");
+        return;
+    }
+    unsigned long received = 0;
+    const char *error = nullptr;
+    Serial.printf("put: ready %u\n", (unsigned)PUT_CHUNK);
+    while (received < size && !error) {
+        size_t want = std::min<size_t>(PUT_CHUNK, size - received), got = 0;
+        uint32_t lastByteAt = millis();
+        while (got < want) {
+            int n = Serial.available();
+            if (n > 0) {
+                got += Serial.readBytes(buf + got, std::min<size_t>(n, want - got));
+                lastByteAt = millis();
+            } else if (millis() - lastByteAt > PUT_TIMEOUT_MS) {
+                error = "timeout";
+                break;
+            }
+        }
+        if (error)
+            break;
+        if (f.write(buf, got) != got) {
+            error = "write failed (card full?)";
+            break;
+        }
+        crc = crc32Update(crc, buf, got);
+        received += got;
+        Serial.printf("put: ok %lu\n", received);
+    }
+    f.close();
+    free(buf);
+    if (!error && crc != expectCrc)
+        error = "CRC mismatch";
+    if (!error && sd.exists(path) && !sd.remove(path))
+        error = "can't replace the old file";
+    if (!error && !sd.rename(tmp.c_str(), path))
+        error = "rename failed";
+    if (error) {
+        sd.remove(tmp.c_str());
+        drainSerial();
+        Serial.printf("put: FAILED %s (%lu of %lu bytes)\n", error, received, size);
+    } else {
+        uint32_t ms = millis() - t0;
+        Serial.printf("put: done %s %lu bytes, crc %08lx, %lu ms (%lu KB/s)\n", path, received, (unsigned long)crc,
+                      (unsigned long)ms, ms ? (unsigned long)(received / ms) : 0);
+    }
+    // The transfer counts as activity, so it doesn't fall asleep right after. (now,
+    // not millis(): loop() compares against its own earlier now.)
+    lastKeyAt = now;
+}
+
 // Ctrl+T over USB: "<utc epoch> <posix tz>\n" sets the clock (tools/settime.py).
 // Any other byte types text, like tools/type.py.
 void handleSerial(uint32_t now) {
@@ -1217,7 +1339,7 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "rm <path>" or "sleep [seconds]"
+        if (b == 0x12) { // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "rm <path>" or "sleep [seconds]"
             String line = Serial.readStringUntil('\n');
             line.trim();
             if (line == "status") {
@@ -1232,6 +1354,29 @@ void handleSerial(uint32_t now) {
                                       (unsigned long)tw::storage::modified(path.c_str()));
                     }
                 }
+            } else if (line == "sd") { // mount the microSD card, list it, write and read back a test file
+                if (!mountSd()) {
+                    Serial.println("sd: mount FAILED (no card, or not FAT32/exFAT)");
+                } else {
+                    SdFat &sd = display.getSdFat();
+                    uint64_t bytes = (uint64_t)sd.card()->sectorCount() * 512;
+                    Serial.printf("sd: card %llu MB, FAT%d, %llu MB free\n", bytes / 1000000, sd.fatType(),
+                                  (uint64_t)sd.freeClusterCount() * sd.bytesPerCluster() / 1000000);
+                    sd.ls(&Serial, LS_SIZE | LS_R);
+                    const char *msg = "typewriter sd test";
+                    auto f = sd.open("/typewriter-test.txt", O_RDWR | O_CREAT | O_TRUNC);
+                    bool wrote = f && f.write(msg, strlen(msg)) == strlen(msg);
+                    f.close();
+                    char buf[32] = {};
+                    f = sd.open("/typewriter-test.txt", O_RDONLY);
+                    if (f)
+                        f.read(buf, sizeof buf - 1);
+                    f.close();
+                    Serial.printf("sd: write %s, read back %s\n", wrote ? "ok" : "FAILED",
+                                  strcmp(buf, msg) == 0 ? "ok" : "FAILED");
+                }
+            } else if (line.startsWith("put ")) {
+                receiveFile(line, now);
             } else if (line.startsWith("sleep")) { // "sleep <seconds>": sleep now, wake on a timer
                 goToSleep(line.length() > 6 ? line.substring(6).toInt() : 0);
             } else if (line.startsWith("rm ")) {
@@ -1568,6 +1713,8 @@ void goToSleep(uint32_t wakeAfterSeconds) {
     drawOpenScreen(ASLEEP, true);
     display.display();
     display.einkOff();
+    if (sdMounted)
+        display.sdCardSleep(); // no power to the card while asleep
     WiFi.disconnect(true);
     esp_sleep_enable_ext0_wakeup(WAKE_BUTTON, 0);
     if (wakeAfterSeconds) // testing over USB
@@ -1603,6 +1750,7 @@ void checkWakeButton(uint32_t now) {
 // ---- Main ----
 
 void setup() {
+    Serial.setRxBufferSize(1024); // Ctrl+R put reads as bytes arrive; this covers ~90 ms of pauses
     Serial.begin(115200);
     display.begin();
     display.setFullUpdateThreshold(0); // we decide when to do full refreshes
