@@ -90,7 +90,8 @@ const uint32_t SLEEP_AFTER_IDLE_MS = 10 * 60 * 1000; // deep sleep after this lo
 const gpio_num_t WAKE_BUTTON = GPIO_NUM_36;           // the board's WAKE button
 const char *ASLEEP = "In sleep";
 const uint32_t BATTERY_CHECK_EVERY_MS = 60000;
-const int LOW_BATTERY_PERCENT = 15;
+const float LOW_BATTERY_V = 3.71;   // about 15% left: the curve gets steep below here
+const float USB_POWER_V = 4.18;     // the charger's 4.2 V shows through (or a full cell)
 
 struct Document {
     std::string path;       // in flash, e.g. /daily/2026-09-29.md
@@ -159,7 +160,10 @@ void showTourStop();
 uint32_t lastUpdateAt = 0;
 uint32_t firstUnshownKeyAt = 0;
 uint32_t seenKeyboardRevision = UINT32_MAX;
-int batteryPercent = -1; // -1: no battery reading
+// What the battery voltage can tell for sure: plugged in, or running low. In
+// between, a Li-ion cell's voltage is too flat to say much, so nothing shows.
+enum class Power { Usb, Battery, Low };
+Power power = Power::Battery;
 uint32_t lastBatteryCheckAt = 0;
 std::string notice;      // one-off message, cleared by the next key
 bool clockFromNetwork = false;
@@ -2044,27 +2048,9 @@ void handleSerial(uint32_t now) {
 
 // ---- Screen ----
 
-// Typical resting voltage of a Li-ion cell at each charge level: the curve is
-// flat in the middle and steep near the ends, so a straight line misleads.
-const float CELL_CURVE[][2] = {{3.40, 0},  {3.61, 5},  {3.69, 10}, {3.73, 20}, {3.77, 30}, {3.79, 40},
-                               {3.82, 50}, {3.86, 60}, {3.91, 70}, {3.97, 80}, {4.05, 90}, {4.15, 100}};
-
-int percentFromVoltage(float v) {
-    const int n = sizeof(CELL_CURVE) / sizeof(CELL_CURVE[0]);
-    if (v <= CELL_CURVE[0][0])
-        return 0;
-    for (int i = 1; i < n; i++) {
-        if (v <= CELL_CURVE[i][0]) {
-            float t = (v - CELL_CURVE[i - 1][0]) / (CELL_CURVE[i][0] - CELL_CURVE[i - 1][0]);
-            return CELL_CURVE[i - 1][1] + t * (CELL_CURVE[i][1] - CELL_CURVE[i - 1][1]);
-        }
-    }
-    return 100;
-}
-
 // Measures the battery: the average of several readings, smoothed over time
-// (radio bursts and the charger's surface charge make single readings jumpy),
-// shown in steps of 5%. force: measure now (Cmd+I) rather than once a minute.
+// (radio bursts and the charger's surface charge make single readings jumpy).
+// force: measure now (Cmd+I) rather than once a minute.
 void checkBattery(uint32_t now, bool force) {
     static float smoothed = 0;
     if (!force && lastBatteryCheckAt && now - lastBatteryCheckAt < BATTERY_CHECK_EVERY_MS)
@@ -2074,23 +2060,18 @@ void checkBattery(uint32_t now, bool force) {
     for (int i = 0; i < 8; i++)
         v += display.readBattery();
     v /= 8;
-    int previous = batteryPercent;
-    // On USB with no battery, or a full one, the charger's 4.2 V shows through.
-    if (v < 3.0 || v >= 4.18) {
-        batteryPercent = -1;
+    Power previous = power;
+    if (v >= USB_POWER_V || v < 3.0) {
+        power = Power::Usb; // under 3 V: no battery, so USB it is
         smoothed = 0;
     } else {
-        smoothed = smoothed == 0 || previous < 0 ? v : smoothed * 0.7f + v * 0.3f;
-        int percent = (percentFromVoltage(smoothed) + 2) / 5 * 5;
-        // On battery the charge only goes down; ignore small upward wobbles.
-        if (previous >= 0 && percent > previous && percent - previous < 10)
-            percent = previous;
-        batteryPercent = percent;
+        smoothed = smoothed == 0 ? v : smoothed * 0.7f + v * 0.3f;
+        // On battery the charge only goes down: once low, it stays low until USB.
+        power = previous == Power::Low || smoothed < LOW_BATTERY_V ? Power::Low : Power::Battery;
     }
-    Serial.printf("battery: %.3f V, smoothed %.3f V (%d%%)\n", v, smoothed, batteryPercent);
-    bool wasLow = previous >= 0 && previous <= LOW_BATTERY_PERCENT;
-    bool isLow = batteryPercent >= 0 && batteryPercent <= LOW_BATTERY_PERCENT;
-    if (wasLow != isLow || (showStatus && previous != batteryPercent))
+    static const char *NAMES[] = {"USB power", "battery", "low battery"};
+    Serial.printf("battery: %.3f V, smoothed %.3f V (%s)\n", v, smoothed, NAMES[(int)power]);
+    if (power != previous)
         markChanged(now);
 }
 
@@ -2124,12 +2105,9 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
         snprintf(out, size, "Keyboard not connected. Press a key on it to wake it.");
     } else if (!tw::wallclock::isSet()) {
         snprintf(out, size, "Clock unset. Connect to USB or Wi-Fi.");
-    } else if (batteryPercent >= 0 && batteryPercent <= LOW_BATTERY_PERCENT) {
-        snprintf(out, size, "Low battery: %d%%", batteryPercent);
+    } else if (power == Power::Low) {
+        snprintf(out, size, "Low battery. Connect to USB.");
     } else if (showStatus) {
-        char battery[24] = "USB power";
-        if (batteryPercent >= 0)
-            snprintf(battery, sizeof(battery), "Battery %d%%", batteryPercent);
         int words = wordCount();
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
         const char *state = doc.unsaved                              ? "Not saved yet"
@@ -2138,7 +2116,10 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
                             : !tw::hasLocalChanges(doc.text, doc.sync) && doc.checkedRemote ? "Synced"
                             : online()                               ? "Saved, not synced yet"
                                                                      : "Saved locally";
-        snprintf(right, rightSize, "%s · %s", state, battery);
+        if (power == Power::Usb)
+            snprintf(right, rightSize, "%s · USB power", state);
+        else
+            snprintf(right, rightSize, "%s", state);
     }
 }
 

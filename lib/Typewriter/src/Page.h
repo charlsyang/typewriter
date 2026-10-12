@@ -10,8 +10,10 @@ namespace tw {
 
 struct Layout {
     int16_t marginX = 64;
-    int16_t marginTop = 64;
-    int16_t textBottom = 720 - 72; // text stops above the footer line
+    // A full page (9 lines) sits centered: ~101px of white above the ascenders
+    // and below the descenders, with the footer, when shown, in the bottom gap.
+    int16_t marginTop = 89;
+    int16_t textBottom = 89 + 584; // same room as before; text stops above the footer line
     int16_t footerTop = 720 - 44;  // notices and the Cmd+I status, when shown
     size_t carryLines = 2; // lines repeated at the top after a page turn
 };
