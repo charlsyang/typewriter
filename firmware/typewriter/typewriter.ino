@@ -2106,7 +2106,7 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
     } else if (!tw::wallclock::isSet()) {
         snprintf(out, size, "Clock unset. Connect to USB or Wi-Fi.");
     } else if (power == Power::Low) {
-        snprintf(out, size, "Low battery. Connect to USB.");
+        snprintf(out, size, "Low battery");
     } else if (showStatus) {
         int words = wordCount();
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
