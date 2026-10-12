@@ -12,14 +12,14 @@ struct Layout {
     int16_t marginX = 64;
     // A full page (10 lines) sits centered: ~71px of white above the ascenders
     // and below the descenders, with the footer, when shown, in the bottom gap.
-    // Room for exactly 10 lines, so blank (half-height) lines can't push a page lower.
+    // Room for exactly 10 lines.
     int16_t marginTop = 60;
     int16_t textBottom = 60 + 10 * 60; // text stops above the footer line
     int16_t footerTop = 720 - 44;  // notices and the Cmd+I status, when shown
     size_t carryLines = 2; // lines repeated at the top after a page turn
 };
 
-// One wrapped line: a byte range of the document. Empty lines draw at half height.
+// One wrapped line: a byte range of the document.
 struct Line {
     size_t start;
     size_t end;

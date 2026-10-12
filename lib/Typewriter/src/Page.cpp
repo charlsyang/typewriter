@@ -10,8 +10,9 @@ Page::Page(Inkplate &display, const GFXfont &body, int16_t bodyAscent, const GFX
       layout_(layout) {
 }
 
-int16_t Page::lineHeight(const Line &line) const {
-    return line.start == line.end ? body_.yAdvance / 2 : body_.yAdvance;
+// Empty lines too take a full line, so every full page ends at the same height.
+int16_t Page::lineHeight(const Line &) const {
+    return body_.yAdvance;
 }
 
 // Greedy word wrap of one paragraph (no '\n' inside). A word wider than the
@@ -90,9 +91,6 @@ int32_t Page::height(const std::vector<Line> &lines) const {
     int32_t h = 0;
     for (const Line &line : lines)
         h += lineHeight(line);
-    // The last line holds the cursor, so it always needs full height.
-    if (!lines.empty() && lines.back().start == lines.back().end)
-        h += body_.yAdvance - lineHeight(lines.back());
     return h;
 }
 
