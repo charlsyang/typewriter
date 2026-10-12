@@ -50,6 +50,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <algorithm>
+#include <esp_heap_caps.h>
 #include <esp_sntp.h>
 #include <fonts/Duo24.h>
 #include <fonts/Duo28.h>
@@ -1484,14 +1485,20 @@ void syncHighlights(SyncJob &j) {
         // writes alternating between files make SdFat reread and rewrite its
         // one-sector cache each time. Each block yields, so the idle task on
         // this core gets to run (a long busy stretch trips the task watchdog).
-        static char buf[4096];
+        // In PSRAM: a static array would hold 4 KB of scarce internal RAM for good.
+        const int BUF_SIZE = 4096;
+        static char *buf = (char *)heap_caps_malloc(BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (!buf) {
+            j.highlightsMessage = "out of memory";
+            return;
+        }
         std::string block;
         std::vector<uint8_t> entries;
         entries.reserve((count + 64) * 8);
         auto next = [&](std::string &line) {
             line.clear();
             while (true) {
-                int n = in.fgets(buf, sizeof buf);
+                int n = in.fgets(buf, BUF_SIZE);
                 if (n <= 0)
                     return !line.empty();
                 line.append(buf, n);
