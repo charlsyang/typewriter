@@ -37,6 +37,20 @@ arduino-cli upload --build-path ../../build/step0 .
 ../../tools/monitor.py
 ```
 
+## Readwise highlights (sleep screen)
+
+The sleep screen shows a highlight from your Readwise library, kept on the microSD card.
+Put your token (readwise.io/access_token) in `secrets.h` as `READWISE_TOKEN`, then copy the
+whole library onto the card once, over USB (~90 s per MB):
+
+```bash
+tools/readwise_seed.py --send
+```
+
+After that the device fetches only what changed, about once a month over Wi-Fi (Ctrl+R `hlsync`
+over USB to do it now). Other USB commands: `hl` (check the files), `hlpick [n]`, `hltest [size]
+[index]`, `hltour`. `tools/highlight_sizes.py` shows how the library fits the text sizes.
+
 ## Board facts (measured)
 
 ESP32-D0WD-V3 at 240 MHz, 4 MB flash, 4 MB PSRAM. Rotation 0 is landscape, 1280×720.

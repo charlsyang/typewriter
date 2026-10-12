@@ -39,8 +39,10 @@
 #include <Highlight.h>
 #include <FastInkplate.h>
 #include <History.h>
+#include <HighlightStore.h>
 #include <Keyboard.h>
 #include <Page.h>
+#include <Readwise.h>
 #include <Storage.h>
 #include <Sync.h>
 #include <Text.h>
@@ -70,6 +72,7 @@ tw::Page::Reading readingPages;
 size_t readingPage = 0;
 bool readingDirty = false;
 tw::Dropbox dropbox(DROPBOX_APP_KEY, DROPBOX_REFRESH_TOKEN);
+tw::Readwise readwise(READWISE_TOKEN);
 
 const uint32_t PASS_US = 20000;               // drive pass length chosen in Step 1
 const uint32_t FOOTER_PASS_US = 55000;        // library-length passes: erases notices cleanly
@@ -112,7 +115,7 @@ struct DraftInfo {
     bool draft = false;
 };
 
-enum class JobKind { File, Drafts };
+enum class JobKind { File, Drafts, Highlights };
 struct SyncJob {
     JobKind kind;
     std::string localPath, remotePath;
@@ -128,6 +131,9 @@ struct SyncJob {
     std::vector<DraftInfo> all;
     bool listed;
     int downloaded, removed, renamed;
+    // Highlights job
+    bool highlightsOk;
+    std::string highlightsMessage;
     const char *why;
     uint32_t startedAt;
 };
@@ -516,11 +522,15 @@ bool pickFreeName(SyncJob &j) {
     return false;
 }
 
+void syncHighlights(SyncJob &j);
+
 void syncTaskLoop(void *) {
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         if (syncJob.kind == JobKind::Drafts)
             refreshDrafts(syncJob);
+        else if (syncJob.kind == JobKind::Highlights)
+            syncHighlights(syncJob);
         else if (syncJob.newDraft && !tw::isBlank(syncJob.text) && !pickFreeName(syncJob))
             syncJob.result = {tw::SyncResult::Failed, "checking the name: " + dropbox.lastError(), false};
         else
@@ -637,6 +647,8 @@ bool syncAllFailed = false;
 std::vector<std::string> syncAllTried; // local paths synced this round (a failure isn't retried)
 std::string openNotice;                // the list's footer until the next key
 
+void finishHighlightsSync();
+
 // Applies a finished sync to the note (or to the file it was for, if you've
 // moved on to another note since).
 void finishSync() {
@@ -647,6 +659,10 @@ void finishSync() {
     SyncJob &j = syncJob;
     if (j.kind == JobKind::Drafts) {
         finishDraftsRefresh();
+        return;
+    }
+    if (j.kind == JobKind::Highlights) {
+        finishHighlightsSync();
         return;
     }
     const tw::SyncResult &r = j.result;
@@ -1378,6 +1394,205 @@ void printRandomHighlight() {
         Serial.printf("hl: #%lu%s %s\n", (unsigned long)pick, favorite ? " (favorite)" : "", line.c_str());
 }
 
+// ---- Keeping the highlights up to date (Readwise) ----
+
+const uint32_t HL_SYNC_EVERY_S = 30 * 24 * 3600;     // a month
+const uint32_t HL_SYNC_RETRY_MS = 6 * 3600 * 1000UL; // after a failure
+uint32_t highlightsSyncedAt = 0;  // state.json's syncedAt (Unix time); 0 = not read yet or none
+bool highlightsStateRead = false;
+bool highlightsSyncWanted = false; // Ctrl+R hlsync
+uint32_t lastHighlightsSyncAt = 0; // millis() of the last attempt
+
+// Reads state.json: syncedAt and the counts. False without a card or files.
+bool readHighlightsState(std::string &syncedAt, uint32_t &count, uint32_t &favorites) {
+    if (!mountSd())
+        return false;
+    FsFile f = display.getSdFat().open("/highlights/state.json", O_RDONLY);
+    char buf[256] = {};
+    if (f)
+        f.read(buf, sizeof buf - 1);
+    f.close();
+    JsonDocument json;
+    if (!buf[0] || deserializeJson(json, buf))
+        return false;
+    syncedAt = json["syncedAt"] | "";
+    count = json["count"] | 0u;
+    favorites = json["favorites"] | 0u;
+    return !syncedAt.empty();
+}
+
+// Writes a whole small file on the card: to <path>.tmp, then renamed over <path>.
+bool writeSdFile(const char *path, const std::string &data) {
+    SdFat &sd = display.getSdFat();
+    std::string tmp = std::string(path) + ".tmp";
+    FsFile f = sd.open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+    bool ok = f && f.write(data.data(), data.size()) == data.size();
+    f.close();
+    if (ok && sd.exists(path))
+        ok = sd.remove(path);
+    return ok && sd.rename(tmp.c_str(), path);
+}
+
+// Runs in the background task: asks Readwise for everything changed since
+// syncedAt, then rewrites highlights.jsonl and index.bin with the changes
+// (into .tmp files, swapped in only when both are complete) and state.json.
+void syncHighlights(SyncJob &j) {
+    j.highlightsOk = false;
+    std::string syncedAt;
+    uint32_t count = 0, favorites = 0;
+    if (!readHighlightsState(syncedAt, count, favorites)) {
+        j.highlightsMessage = "no highlights on the card (run tools/readwise_seed.py --send)";
+        return;
+    }
+    // A minute's overlap: anything changed while this runs comes again next time.
+    std::string startedAt = tw::highlights::isoTime((uint32_t)time(nullptr) - 60);
+
+    std::map<uint32_t, tw::highlights::Record> changes;
+    int kept = 0, removed = 0;
+    std::string cursor;
+    for (int page = 0; page < 50; page++) {
+        bool ok = readwise.exportPage(syncedAt, cursor, [&](const tw::highlights::Incoming &h) {
+            if (tw::highlights::keep(h)) {
+                changes[h.id] = tw::highlights::toRecord(h);
+                kept++;
+            } else {
+                changes[h.id] = tw::highlights::Record(); // id 0: remove it, if it's on the card
+                removed++;
+            }
+        });
+        if (!ok) {
+            j.highlightsMessage = "Readwise: " + readwise.lastError();
+            return;
+        }
+        Serial.printf("highlights: page %d, %u bytes, %d changes so far\n", page + 1, (unsigned)readwise.lastBytes(),
+                      kept + removed);
+        if (cursor.empty())
+            break;
+    }
+
+    SdFat &sd = display.getSdFat();
+    tw::highlights::Counts counts = {count, favorites};
+    if (!changes.empty()) {
+        FsFile in = sd.open("/highlights/highlights.jsonl", O_RDONLY);
+        FsFile out = sd.open("/highlights/highlights.jsonl.tmp", O_WRONLY | O_CREAT | O_TRUNC);
+        FsFile index = sd.open("/highlights/index.bin.tmp", O_WRONLY | O_CREAT | O_TRUNC);
+        if (!in || !out || !index) {
+            j.highlightsMessage = "can't open the files on the card";
+            return;
+        }
+        // Lines go out in 8 KB blocks and the index in one piece at the end: small
+        // writes alternating between files make SdFat reread and rewrite its
+        // one-sector cache each time. Each block yields, so the idle task on
+        // this core gets to run (a long busy stretch trips the task watchdog).
+        static char buf[4096];
+        std::string block;
+        std::vector<uint8_t> entries;
+        entries.reserve((count + 64) * 8);
+        auto next = [&](std::string &line) {
+            line.clear();
+            while (true) {
+                int n = in.fgets(buf, sizeof buf);
+                if (n <= 0)
+                    return !line.empty();
+                line.append(buf, n);
+                if (line.back() == '\n') {
+                    line.pop_back();
+                    return true;
+                }
+            }
+        };
+        uint32_t offset = 0;
+        auto flush = [&]() {
+            bool ok = out.write(block.data(), block.size()) == block.size();
+            block.clear();
+            vTaskDelay(1);
+            return ok;
+        };
+        auto write = [&](const std::string &line, bool favorite) {
+            uint8_t entry[8];
+            tw::highlights::indexEntry(offset, favorite, entry);
+            entries.insert(entries.end(), entry, entry + 8);
+            offset += line.size() + 1;
+            block += line;
+            block += '\n';
+            return block.size() < 8192 || flush();
+        };
+        counts = tw::highlights::merge(next, changes, write);
+        in.close();
+        bool written = counts.highlights > 0 && flush();
+        for (size_t at = 0; written && at < entries.size(); at += 8192) {
+            size_t n = std::min<size_t>(8192, entries.size() - at);
+            written = index.write(entries.data() + at, n) == n;
+            vTaskDelay(1);
+        }
+        written = out.close() && index.close() && written;
+        if (!written) {
+            sd.remove("/highlights/highlights.jsonl.tmp");
+            sd.remove("/highlights/index.bin.tmp");
+            j.highlightsMessage = "writing the files failed (card full?)";
+            return;
+        }
+        sd.remove("/highlights/index.bin");
+        sd.remove("/highlights/highlights.jsonl");
+        if (!sd.rename("/highlights/index.bin.tmp", "/highlights/index.bin") ||
+            !sd.rename("/highlights/highlights.jsonl.tmp", "/highlights/highlights.jsonl")) {
+            j.highlightsMessage = "replacing the files failed";
+            return;
+        }
+    }
+    char state[160];
+    snprintf(state, sizeof state, "{\"version\":1,\"syncedAt\":\"%s\",\"count\":%lu,\"favorites\":%lu}",
+             startedAt.c_str(), (unsigned long)counts.highlights, (unsigned long)counts.favorites);
+    if (!writeSdFile("/highlights/state.json", state)) {
+        j.highlightsMessage = "writing state.json failed";
+        return;
+    }
+    j.highlightsOk = true;
+    char msg[128];
+    snprintf(msg, sizeof msg, "%d changed since %s (%d kept, %d left out or deleted); %lu on the card now",
+             kept + removed, syncedAt.c_str(), kept, removed, (unsigned long)counts.highlights);
+    j.highlightsMessage = msg;
+}
+
+void startHighlightsSync(const char *why) {
+    syncJob.kind = JobKind::Highlights;
+    syncJob.why = why;
+    syncJob.startedAt = millis();
+    lastHighlightsSyncAt = millis();
+    highlightsSyncWanted = false;
+    syncDone = false;
+    syncRunning = true;
+    xTaskNotifyGive(syncTask);
+}
+
+void finishHighlightsSync() {
+    SyncJob &j = syncJob;
+    Serial.printf("highlights (%s): %s in %lu ms: %s\n", j.why, j.highlightsOk ? "synced" : "FAILED",
+                  (unsigned long)(millis() - j.startedAt), j.highlightsMessage.c_str());
+    highlightsStateRead = false; // read the new syncedAt next time
+}
+
+// Called from loop(): starts the monthly sync when it's due, or when asked.
+// Needs Wi-Fi, a clock that's set (for syncedAt) and the background task free.
+void checkHighlightsSync(bool idle) {
+    if (syncRunning || !online() || !tw::wallclock::isSet())
+        return;
+    if (highlightsSyncWanted) {
+        startHighlightsSync("asked");
+        return;
+    }
+    if (!idle || (lastHighlightsSyncAt && millis() - lastHighlightsSyncAt < HL_SYNC_RETRY_MS))
+        return;
+    if (!highlightsStateRead) {
+        highlightsStateRead = true;
+        std::string syncedAt;
+        uint32_t count, favorites;
+        highlightsSyncedAt = readHighlightsState(syncedAt, count, favorites) ? tw::highlights::parseIsoTime(syncedAt) : 0;
+    }
+    if (highlightsSyncedAt && (uint32_t)time(nullptr) - highlightsSyncedAt > HL_SYNC_EVERY_S)
+        startHighlightsSync("monthly");
+}
+
 // Libron at a size: the quote's sizes, and 28 for title and author.
 const tw::GrayFont &libron(int size) {
     switch (size) {
@@ -1550,6 +1765,10 @@ bool pickHighlight(PickedHighlight &out, const tw::highlight::Recent &recent, Pi
 // "In sleep". Remembers it in recentHighlights. False (nothing drawn) without a
 // card, files, memory or a highlight that fits; the list is shown instead.
 bool showSleepHighlight() {
+    if (syncRunning && syncJob.kind == JobKind::Highlights) {
+        Serial.println("sleep: highlights still syncing, showing the list");
+        return false;
+    }
     uint32_t t0 = millis();
     PickedHighlight h;
     if (!pickHighlight(h, recentHighlights)) {
@@ -1721,7 +1940,7 @@ void handleSerial(uint32_t now) {
             handleKey(nav, now);
             continue;
         }
-        // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "hlpick [n]", "hltest [size] [index]",
+        // Ctrl+R over USB, then "status", "ls", "sd", "put ...", "hl", "hlsync", "hlpick [n]", "hltest [size] [index]",
         // "hltour <size>:<index> ...", "rm <path>" or "sleep [seconds]"
         if (b == 0x12) {
             String line = Serial.readStringUntil('\n');
@@ -1763,6 +1982,9 @@ void handleSerial(uint32_t now) {
                 receiveFile(line, now);
             } else if (line == "hl") {
                 printRandomHighlight();
+            } else if (line == "hlsync") {
+                highlightsSyncWanted = true;
+                Serial.println("highlights: sync asked for; starts when Wi-Fi and the background task are free");
             } else if (line.startsWith("hlpick")) {
                 testPicks(line.length() > 7 ? line.substring(7).toInt() : 100);
             } else if (line.startsWith("hltour ")) {
@@ -2246,6 +2468,9 @@ void loop() {
         draftsWanted = true;
     if (draftsWanted && online() && !syncRunning && (doc.checkedRemote || doc.remotePath.empty()))
         startDraftsRefresh();
+    // Highlights: once a month, after the notes (Ctrl+R hlsync: now).
+    if (doc.checkedRemote || doc.remotePath.empty())
+        checkHighlightsSync(idle);
     // Then catch up on other notes left unsynced, one at a time, while you pause.
     static uint32_t lastBacklogCheckAt = 0;
     if (idle && online() && !syncRunning && doc.checkedRemote && now - lastBacklogCheckAt > SYNC_RETRY_MS) {
