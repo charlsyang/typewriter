@@ -10,11 +10,11 @@ namespace tw {
 
 struct Layout {
     int16_t marginX = 64;
-    // A full page (10 lines) sits centered: ~71px of white above the ascenders
+    // A full page (9 lines) sits centered: ~86px of white above the ascenders
     // and below the descenders, with the footer, when shown, in the bottom gap.
-    // Room for exactly 10 lines.
-    int16_t marginTop = 60;
-    int16_t textBottom = 60 + 10 * 60; // text stops above the footer line
+    int16_t lineHeight = 64; // 1.6 x the 40px font; the text sits centered in it
+    int16_t marginTop = 72;
+    int16_t textBottom = 72 + 9 * 64; // room for exactly 9 lines; above the footer line
     int16_t footerTop = 720 - 44;  // notices and the Cmd+I status, when shown
     size_t carryLines = 2; // lines repeated at the top after a page turn
 };
@@ -68,6 +68,8 @@ class Page {
     std::vector<Line> linesFrom(const std::string &text, size_t top) const;
     int32_t height(const std::vector<Line> &lines) const;
     int16_t lineHeight(const Line &line) const;
+    // Baseline below a line's top: the text centered in the (maybe looser) line.
+    int16_t baselineOffset() const { return bodyAscent_ + (layout_.lineHeight - body_.yAdvance) / 2; }
     size_t pageEnd(const std::vector<Line> &lines, size_t start) const; // one past the last line that fits
     void clearRows(int32_t y0, int32_t y1);
 

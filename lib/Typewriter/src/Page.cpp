@@ -12,7 +12,7 @@ Page::Page(Inkplate &display, const GFXfont &body, int16_t bodyAscent, const GFX
 
 // Empty lines too take a full line, so every full page ends at the same height.
 int16_t Page::lineHeight(const Line &) const {
-    return body_.yAdvance;
+    return layout_.lineHeight;
 }
 
 // Greedy word wrap of one paragraph (no '\n' inside). A word wider than the
@@ -135,7 +135,7 @@ void Page::renderReading(const std::string &text, const Reading &reading, size_t
     size_t end = pageEnd(reading.lines, first);
     int32_t y = layout_.marginTop;
     for (size_t k = first; k < end; k++) {
-        drawText(display_, body_, layout_.marginX, y + bodyAscent_, text.c_str(), reading.lines[k].start,
+        drawText(display_, body_, layout_.marginX, y + baselineOffset(), text.c_str(), reading.lines[k].start,
                  reading.lines[k].end);
         y += lineHeight(reading.lines[k]);
     }
@@ -236,14 +236,14 @@ bool Page::render(const std::string &text, const char *footerLeft, const char *f
     int32_t cursorX = layout_.marginX;
     int32_t cursorY = y;
     for (size_t k = from; k < lines.size(); k++) {
-        cursorX = drawText(display_, body_, layout_.marginX, y + bodyAscent_, s, lines[k].start, lines[k].end);
+        cursorX = drawText(display_, body_, layout_.marginX, y + baselineOffset(), s, lines[k].start, lines[k].end);
         cursorY = y;
         y += lineHeight(lines[k]);
     }
 
     // Cursor: a slim bar just after the last character.
-    const int16_t size = body_.yAdvance * 2 / 3; // font size in px (line spacing is 1.5)
-    display_.fillRect(cursorX + 4, cursorY + size * 15 / 100, 3, size * 90 / 100, BLACK);
+    const int16_t size = body_.yAdvance * 2 / 3; // font size in px (the font's line spacing is 1.5)
+    display_.fillRect(cursorX + 4, cursorY + (layout_.lineHeight - body_.yAdvance) / 2 + size * 15 / 100, 3, size * 90 / 100, BLACK);
 
     if (!patch || footer != shownFooter_) {
         if (patch)
