@@ -353,6 +353,7 @@ bool isBlankNewDraft(const std::string &localPath) {
 SyncJob syncJob;
 volatile bool syncRunning = false;
 volatile bool syncDone = false;
+bool syncRequested = false; // Cmd+S while the sync task was busy: the open note goes next
 size_t shortestSinceSnapshot = 0; // Backspace below the snapshot while syncing
 TaskHandle_t syncTask;
 
@@ -1194,6 +1195,8 @@ void handleKey(const tw::KeyEvent &e, uint32_t now) {
                 notice = "Unable to sync undated note. Saved locally.";
             else if (!online())
                 notice = "Saved locally. Connect to Wi-Fi to sync.";
+            else if (syncRunning)
+                syncRequested = true; // after the job running now, ahead of any other
             else
                 startSync("Cmd+S");
             markChanged(now);
@@ -2131,7 +2134,7 @@ void footer(char *out, size_t size, char *right, size_t rightSize) {
         snprintf(out, size, "%s · %d %s", doc.name.c_str(), words, words == 1 ? "word" : "words");
         const char *state = doc.unsaved                              ? "Not saved yet"
                             : doc.remotePath.empty()                 ? "Saved locally, note is undated"
-                            : syncRunning                            ? "Syncing…"
+                            : syncRunning || syncRequested           ? "Syncing…"
                             : !tw::hasLocalChanges(doc.text, doc.sync) && doc.checkedRemote ? "Synced"
                             : online()                               ? "Saved, not synced yet"
                                                                      : "Saved locally";
@@ -2447,6 +2450,10 @@ void loop() {
     checkBattery(now);
     checkNetworkClock();
     finishSync();
+    if (syncRequested && !syncRunning) {
+        syncRequested = false;
+        startSync("Cmd+S");
+    }
 
     if (now - lastKeyAt > SLEEP_AFTER_IDLE_MS && !showingPairing)
         goToSleep();
