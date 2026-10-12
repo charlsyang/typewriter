@@ -7,8 +7,9 @@
 // line appears when something needs attention, or on Cmd+I.
 //
 // After 10 minutes without typing, or a press of the WAKE button, it saves,
-// syncs and deep-sleeps showing the list, so your writing isn't left on screen.
-// Waking and switching on both start at the list.
+// syncs and deep-sleeps showing one of your Readwise highlights from the SD
+// card (tools/readwise_seed.py), so your writing isn't left on screen; without
+// a card, the list. Waking and switching on both start at the list.
 //
 // Wi-Fi and Dropbox credentials are in secrets.h (see secrets.example.h).
 //
@@ -1468,6 +1469,13 @@ int drawHighlight(tw::GrayCanvas &canvas, const std::string &raw, const std::str
     return px;
 }
 
+// "In sleep", centered in the bottom padding where the list puts it.
+void drawAsleepNote(tw::GrayCanvas &canvas) {
+    const char *asleep = ASLEEP;
+    int32_t w = tw::measure(Duo24, asleep, 0, strlen(asleep));
+    tw::drawText(canvas, Duo24, (display.width() - w) / 2, 720 - 44 + Duo24Ascent, asleep, 0, strlen(asleep));
+}
+
 // Whether a highlight's text fits the sleep screen at one of HL_SIZES.
 bool highlightFits(const std::string &raw) {
     std::string text = tw::highlight::clean(raw, libronHasGlyph);
@@ -1538,6 +1546,33 @@ bool pickHighlight(PickedHighlight &out, const tw::highlight::Recent &recent, Pi
     return false;
 }
 
+// The sleep screen: a highlight picked by pickHighlight(), in 3-bit, with
+// "In sleep". Remembers it in recentHighlights. False (nothing drawn) without a
+// card, files, memory or a highlight that fits; the list is shown instead.
+bool showSleepHighlight() {
+    uint32_t t0 = millis();
+    PickedHighlight h;
+    if (!pickHighlight(h, recentHighlights)) {
+        Serial.println("sleep: no highlight to show (no card or files?)");
+        return false;
+    }
+    tw::GrayCanvas canvas(display.width(), display.height());
+    if (!canvas.begin()) {
+        Serial.println("sleep: out of memory for the highlight");
+        return false;
+    }
+    int px = drawHighlight(canvas, h.text, h.title, h.author, 0);
+    if (!px)
+        return false;
+    drawAsleepNote(canvas);
+    uint32_t t1 = millis();
+    canvas.show(display);
+    recentHighlights.add(h.id);
+    Serial.printf("sleep: highlight #%lu%s at %dpx, picked and drawn in %lu ms, panel %lu ms\n", (unsigned long)h.index,
+                  h.favorite ? " (favorite)" : "", px, (unsigned long)(t1 - t0), (unsigned long)(millis() - t1));
+    return true;
+}
+
 // Ctrl+R "hlpick [n]": picks n highlights as the sleep screen will (remembering
 // each in a recent list of its own, not the real one) and reports how it went.
 void testPicks(int n) {
@@ -1602,9 +1637,7 @@ void showGrayTest(int size, int32_t index, const char *label = nullptr) {
                       (unsigned)lines, size > 0 ? size : HL_SIZES[std::size(HL_SIZES) - 1]);
         return;
     }
-    const char *asleep = ASLEEP;
-    int32_t w = tw::measure(Duo24, asleep, 0, strlen(asleep));
-    tw::drawText(canvas, Duo24, (display.width() - w) / 2, 720 - 44 + Duo24Ascent, asleep, 0, strlen(asleep));
+    drawAsleepNote(canvas);
     if (label)
         tw::drawText(canvas, Duo24, 64, 720 - 44 + Duo24Ascent, label, 0, strlen(label));
     uint32_t t1 = millis();
@@ -2055,9 +2088,9 @@ void waitForBackground(uint32_t limitMs) {
     finishSync();
 }
 
-// Saves, syncs what it can, shows the list with a small note (so your writing
-// isn't left on screen), and sleeps until the WAKE button. Waking restarts the
-// program at the list.
+// Saves, syncs what it can, shows a highlight (or the list, without a card)
+// with a small note, so your writing isn't left on screen, and sleeps until the
+// WAKE button. Waking restarts the program at the list.
 void goToSleep(uint32_t wakeAfterSeconds) {
     Serial.println("sleep: going to sleep");
     save("sleep");
@@ -2070,9 +2103,11 @@ void goToSleep(uint32_t wakeAfterSeconds) {
     reading = false;
     if (screen != Screen::Open)
         showOpenScreen();
-    // A full refresh: the resting image should be clean, with no ghosting.
-    drawOpenScreen(ASLEEP, true);
-    display.display();
+    // A full refresh either way: the resting image should be clean, with no ghosting.
+    if (!showSleepHighlight()) {
+        drawOpenScreen(ASLEEP, true);
+        display.display();
+    }
     display.einkOff();
     if (sdMounted)
         display.sdCardSleep(); // no power to the card while asleep
