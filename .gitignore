@@ -10,3 +10,5 @@ sdkconfig.defaults
 sdkconfig.inkplate5v2
 dependencies.lock
 __pycache__/
+.claude/
+.conductor/
