@@ -618,16 +618,9 @@ bool findBacklog(std::string &localPath, std::string &remotePath, const std::vec
         std::string path = folder.local + name;
         if (path == doc.path || std::find(skip.begin(), skip.end(), path) != skip.end())
             continue;
-        // Only notes that have synced before: older notes written before sync
-        // existed are left for you to decide about. New drafts started here
-        // are the exception, once they have something in them.
-        tw::SyncState state;
-        if (!tw::loadSyncState(path, state))
-            continue;
-        if (state.rev.empty() && (!isEssay(path) || isBlankNewDraft(path)))
-            continue;
-        long size = tw::storage::size(path.c_str());
-        if ((size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength) {
+        // Older notes written before sync existed (no sync state) are left for
+        // you to decide about. Blank ones never synced stay here.
+        if (tw::waitingToSync(path)) {
             localPath = path;
             remotePath = folder.remote + name;
             return true;

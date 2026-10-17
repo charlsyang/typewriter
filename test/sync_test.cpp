@@ -187,6 +187,16 @@ int main() {
         EXPECT(r.outcome == SyncResult::Downloaded && text == "Started on the laptop.");
     }
     {
+        puts("daily note: written offline, never synced, laptop has one too: both kept");
+        Dropbox db;
+        SyncState s;
+        db.put(PATH, "Started on the laptop.");
+        std::string text = "Written outside.";
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::Merged);
+        EXPECT(db.files[PATH] == "Started on the laptop.\n\nWritten outside." && text == db.files[PATH]);
+    }
+    {
         puts("daily note: cleared after syncing: deleted from Dropbox");
         Dropbox db;
         SyncState s;
@@ -324,6 +334,36 @@ int main() {
                back.keptLength == 10 && back.id == "id:abc");
         storage::write("/blog/old.mdx.sync", "r3\n5\n5\n");
         EXPECT(loadSyncState("/blog/old.mdx", back) && back.rev == "r3" && back.id.empty());
+    }
+    {
+        puts("backlog: which notes on the Inkplate still need to go up");
+        SyncState never; // saved offline, never reached Dropbox
+        storage::write("/daily/2026-10-02.md", "Written outside.");
+        saveSyncState("/daily/2026-10-02.md", never);
+        EXPECT(waitingToSync("/daily/2026-10-02.md"));
+        storage::write("/daily/2026-10-03.md", " \n\n");
+        saveSyncState("/daily/2026-10-03.md", never);
+        EXPECT(!waitingToSync("/daily/2026-10-03.md")); // blank: stays here
+        storage::write("/daily/2025-01-01.md", "From before sync existed.");
+        EXPECT(!waitingToSync("/daily/2025-01-01.md")); // no sync state: left alone
+        SyncState synced;
+        synced.rev = "r1";
+        synced.syncedLength = synced.keptLength = 5;
+        storage::write("/daily/2026-10-04.md", "Done.");
+        saveSyncState("/daily/2026-10-04.md", synced);
+        EXPECT(!waitingToSync("/daily/2026-10-04.md")); // up to date
+        storage::write("/daily/2026-10-04.md", "Done. More.");
+        EXPECT(waitingToSync("/daily/2026-10-04.md")); // typed since
+        storage::write("/daily/2026-10-04.md", "Gone");
+        synced.keptLength = 4;
+        saveSyncState("/daily/2026-10-04.md", synced);
+        EXPECT(waitingToSync("/daily/2026-10-04.md")); // Backspace into synced text
+        storage::write("/blog/untitled.mdx", "A new draft.");
+        saveSyncState("/blog/untitled.mdx", never);
+        EXPECT(waitingToSync("/blog/untitled.mdx"));
+        storage::write("/blog/untitled-1.mdx", "");
+        saveSyncState("/blog/untitled-1.mdx", never);
+        EXPECT(!waitingToSync("/blog/untitled-1.mdx"));
     }
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;
