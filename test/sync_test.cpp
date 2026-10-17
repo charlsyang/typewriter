@@ -187,6 +187,16 @@ int main() {
         EXPECT(r.outcome == SyncResult::Downloaded && text == "Started on the laptop.");
     }
     {
+        puts("daily note: written offline, never synced, laptop has one too: both kept");
+        Dropbox db;
+        SyncState s;
+        db.put(PATH, "Started on the laptop.");
+        std::string text = "Written outside.";
+        SyncResult r = syncFile(db, PATH, text, s, true);
+        EXPECT(r.outcome == SyncResult::Merged);
+        EXPECT(db.files[PATH] == "Started on the laptop.\n\nWritten outside." && text == db.files[PATH]);
+    }
+    {
         puts("daily note: cleared after syncing: deleted from Dropbox");
         Dropbox db;
         SyncState s;

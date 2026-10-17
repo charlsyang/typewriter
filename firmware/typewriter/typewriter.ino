@@ -618,14 +618,21 @@ bool findBacklog(std::string &localPath, std::string &remotePath, const std::vec
         std::string path = folder.local + name;
         if (path == doc.path || std::find(skip.begin(), skip.end(), path) != skip.end())
             continue;
-        // Only notes that have synced before: older notes written before sync
-        // existed are left for you to decide about. New drafts started here
-        // are the exception, once they have something in them.
+        // Only notes with a sync state: older notes written before sync existed
+        // are left for you to decide about. A note that never reached Dropbox
+        // (written offline, and the day ended before Wi-Fi came back) goes up
+        // once it has something in it; blank ones stay here.
         tw::SyncState state;
         if (!tw::loadSyncState(path, state))
             continue;
-        if (state.rev.empty() && (!isEssay(path) || isBlankNewDraft(path)))
-            continue;
+        if (state.rev.empty()) {
+            std::string text;
+            if (!tw::storage::read(path.c_str(), text) || tw::isBlank(text))
+                continue;
+            localPath = path;
+            remotePath = folder.remote + name;
+            return true;
+        }
         long size = tw::storage::size(path.c_str());
         if ((size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength) {
             localPath = path;
