@@ -90,6 +90,19 @@ bool hasLocalChanges(const std::string &text, const SyncState &state) {
     return text.size() != state.syncedLength || state.keptLength < state.syncedLength;
 }
 
+bool waitingToSync(const std::string &localPath) {
+    SyncState state;
+    if (!loadSyncState(localPath, state))
+        return false;
+    if (state.rev.empty()) {
+        std::string text;
+        return storage::read(localPath.c_str(), text) && !isBlank(text);
+    }
+    // The size is enough here, without reading the whole file.
+    long size = storage::size(localPath.c_str());
+    return (size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength;
+}
+
 SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state,
                     bool blankMeansAbsent) {
     SyncResult result = {SyncResult::UpToDate, "", false};

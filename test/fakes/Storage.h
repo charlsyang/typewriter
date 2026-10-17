@@ -16,6 +16,9 @@ inline bool read(const char *path, std::string &out) {
     out = files()[path];
     return true;
 }
+inline long size(const char *path) {
+    return files().count(path) ? (long)files()[path].size() : -1;
+}
 inline bool write(const char *path, const std::string &data) {
     files()[path] = data;
     return true;

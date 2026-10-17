@@ -26,6 +26,11 @@ bool saveSyncState(const std::string &localPath, const SyncState &state);
 // True if the text changed since the last sync.
 bool hasLocalChanges(const std::string &text, const SyncState &state);
 
+// True if the file at localPath has text Dropbox doesn't have yet: changed since
+// it last synced, or never synced (written offline) and not blank. A file with
+// no sync state (written before sync existed) never counts.
+bool waitingToSync(const std::string &localPath);
+
 struct SyncResult {
     enum Outcome {
         UpToDate,   // nothing to do
