@@ -365,6 +365,38 @@ int main() {
         saveSyncState("/blog/untitled-1.mdx", never);
         EXPECT(!waitingToSync("/blog/untitled-1.mdx"));
     }
+    {
+        puts("cleanup: past notes go once Dropbox has all of them");
+        SyncState synced;
+        synced.rev = "r1";
+        synced.syncedLength = synced.keptLength = 5;
+        storage::write("/daily/2026-10-05.md", "Done.");
+        saveSyncState("/daily/2026-10-05.md", synced);
+        EXPECT(safelyInDropbox("/daily/2026-10-05.md")); // up to date
+        storage::write("/daily/2026-10-05.md", "Done. More.");
+        EXPECT(!safelyInDropbox("/daily/2026-10-05.md")); // typed since
+        storage::write("/daily/2026-10-05.md", "Gone");
+        synced.keptLength = 4;
+        saveSyncState("/daily/2026-10-05.md", synced);
+        EXPECT(!safelyInDropbox("/daily/2026-10-05.md")); // Backspace into synced text
+        storage::write("/daily/2026-10-05.md", "");
+        saveSyncState("/daily/2026-10-05.md", synced);
+        EXPECT(!safelyInDropbox("/daily/2026-10-05.md")); // cleared: Dropbox copy not deleted yet
+        SyncState never;
+        storage::write("/daily/2026-10-06.md", "Written outside.");
+        saveSyncState("/daily/2026-10-06.md", never);
+        EXPECT(!safelyInDropbox("/daily/2026-10-06.md")); // never reached Dropbox
+        storage::write("/daily/2026-10-07.md", "");
+        saveSyncState("/daily/2026-10-07.md", never);
+        EXPECT(safelyInDropbox("/daily/2026-10-07.md")); // blank, never synced: nothing to lose
+        storage::write("/daily/2026-10-08.md", " \n");
+        saveSyncState("/daily/2026-10-08.md", never);
+        EXPECT(safelyInDropbox("/daily/2026-10-08.md"));
+        storage::write("/daily/2025-01-02.md", "From before sync existed.");
+        EXPECT(!safelyInDropbox("/daily/2025-01-02.md")); // no sync state: left alone
+        storage::write("/daily/2025-01-03.md", "");
+        EXPECT(!safelyInDropbox("/daily/2025-01-03.md"));
+    }
     printf(failures ? "\n%d FAILED\n" : "\nall passed\n", failures);
     return failures ? 1 : 0;
 }

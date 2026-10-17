@@ -31,6 +31,12 @@ bool hasLocalChanges(const std::string &text, const SyncState &state);
 // no sync state (written before sync existed) never counts.
 bool waitingToSync(const std::string &localPath);
 
+// True if the file at localPath can be removed from flash without losing
+// anything: it synced and Dropbox has all of it, or it's blank and never synced.
+// A file with no sync state (written before sync existed) is always kept. The
+// caller keeps today's note and the open one.
+bool safelyInDropbox(const std::string &localPath);
+
 struct SyncResult {
     enum Outcome {
         UpToDate,   // nothing to do

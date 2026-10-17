@@ -103,6 +103,12 @@ bool waitingToSync(const std::string &localPath) {
     return (size >= 0 && (size_t)size != state.syncedLength) || state.keptLength < state.syncedLength;
 }
 
+bool safelyInDropbox(const std::string &localPath) {
+    SyncState state;
+    // Never synced, waitingToSync is false only for a blank note: nothing to lose.
+    return loadSyncState(localPath, state) && !waitingToSync(localPath);
+}
+
 SyncResult syncFile(Dropbox &dropbox, const std::string &remotePath, std::string &text, SyncState &state,
                     bool blankMeansAbsent) {
     SyncResult result = {SyncResult::UpToDate, "", false};

@@ -630,6 +630,25 @@ bool findBacklog(std::string &localPath, std::string &remotePath, const std::vec
     return false;
 }
 
+// Removes a past daily note from flash once Dropbox has all of it (or it's
+// blank and never synced). Today's note, the open one, the one a sync is
+// working on, undated.md and notes from before sync existed stay.
+bool forgetIfSynced(const std::string &path) {
+    if (path.rfind("/daily/", 0) != 0 || !isMarkdown(path) || path == "/daily/undated.md" ||
+        path == "/daily/" + todayName() || path == doc.path || (syncRunning && path == syncJob.localPath) ||
+        !tw::safelyInDropbox(path))
+        return false;
+    tw::storage::remove(path.c_str());
+    tw::storage::remove((path + ".sync").c_str());
+    Serial.printf("cleanup: removed %s (in Dropbox)\n", path.c_str());
+    return true;
+}
+
+void forgetSyncedDailyNotes() {
+    for (const std::string &name : tw::storage::list("/daily"))
+        forgetIfSynced("/daily/" + name);
+}
+
 void finishDraftsRefresh();
 void moveNewDraft(SyncJob &j);
 void followRename(SyncJob &j, const std::string &newRemotePath);
@@ -715,6 +734,7 @@ void finishSync() {
             if (r.textChanged)
                 tw::storage::write(j.localPath.c_str(), j.text);
             tw::saveSyncState(j.localPath, j.state);
+            forgetIfSynced(j.localPath); // a past day's note, now in Dropbox
         }
         return;
     }
@@ -1027,6 +1047,7 @@ void continueSyncAll() {
         return;
     } else {
         syncAllActive = false;
+        forgetSyncedDailyNotes();
         openNotice = syncAllFailed ? "Partially synced. Saved locally." : "Synced";
     }
     if (screen == Screen::Open)
