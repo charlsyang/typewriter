@@ -84,8 +84,14 @@ const uint32_t SAVE_AT_LEAST_EVERY_MS = 30000; // ...or at least this often whil
 const uint32_t SYNC_AFTER_IDLE_MS = 60000;    // sync once typing pauses this long
 const uint32_t SYNC_RETRY_MS = 120000;        // wait this long after a failed sync
 const int SYNC_FAILURES_BEFORE_NOTICE = 3;
-const char *DAILY_NOTES = "/OS/Daily Notes/"; // in Dropbox
-const char *ESSAYS = "/Site/blog";            // in Dropbox
+#ifndef DROPBOX_DAILY_NOTES
+#define DROPBOX_DAILY_NOTES "/OS/Daily Notes/"
+#endif
+#ifndef DROPBOX_ESSAYS
+#define DROPBOX_ESSAYS "/Site/blog"
+#endif
+const char *DAILY_NOTES = DROPBOX_DAILY_NOTES; // in Dropbox, set in secrets.h
+const char *ESSAYS = DROPBOX_ESSAYS;           // in Dropbox, set in secrets.h
 const uint32_t SLEEP_AFTER_IDLE_MS = 10 * 60 * 1000; // deep sleep after this long without typing
 const gpio_num_t WAKE_BUTTON = GPIO_NUM_36;           // the board's WAKE button
 const char *ASLEEP = "In sleep";
